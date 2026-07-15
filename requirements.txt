@@ -1,0 +1,11 @@
+# DrissionPage —— 浏览器自动化与接口请求
+DrissionPage>=4.0.0
+
+# PyYAML —— 读取 YAML 配置
+PyYAML>=6.0
+
+# plyer —— 跨平台桌面通知
+plyer>=2.1
+
+# requests —— 消息推送（Server酱/钉钉 Webhook 等）
+requests>=2.31.0

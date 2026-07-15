@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 用户私有配置（含账号密码，切勿提交）
+config/config.yaml
+
+# 会话 / cookies 缓存
+*.cookies
+cookies/
+.session/
+
+# 日志
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
