@@ -256,8 +256,26 @@ class LoginManager:
             return False
         # 先打开域名页再注入 cookies，确保 domain 生效
         self.page.get(LOGIN_URL)
-        self.page.set.cookies(data)
-        logger.info("已加载 %d 条本地 cookies。", len(data))
+        # 用底层 CDP 注入,绕开 DrissionPage 4.2.0b9 的 page.set.cookies 递归 bug
+        loaded = 0
+        for c in data:
+            params = {
+                "name": c.get("name"),
+                "value": c.get("value"),
+                "domain": c.get("domain"),
+                "path": c.get("path", "/"),
+            }
+            for k in ("expires", "httpOnly", "secure", "sameSite"):
+                if k in c and c[k] is not None:
+                    params[k] = c[k]
+            try:
+                self.page.run_cdp("Network.setCookie", **params)
+                loaded += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("注入 cookie %s 失败：%s", c.get("name"), exc)
+        if loaded == 0:
+            return False
+        logger.info("已加载 %d 条本地 cookies。", loaded)
         return True
 
 
