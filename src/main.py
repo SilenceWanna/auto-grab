@@ -47,7 +47,7 @@ def run() -> int:
             return 3
 
         query = TicketQuery(cfg.trip, page=login_mgr.page)
-        order_mgr = OrderManager(cfg.passengers, page=login_mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip)
+        order_mgr = OrderManager(cfg.passengers, page=login_mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip, query=query)
         query.load_station_map()
 
         # 4. 轮询抢票主循环

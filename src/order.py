@@ -54,11 +54,12 @@ SEAT_TYPE_CODE = {
 class OrderManager:
     """负责命中余票后的下单占座流程。"""
 
-    def __init__(self, passengers: list[str], page=None, dry_run: bool = True, trip=None):
+    def __init__(self, passengers: list[str], page=None, dry_run: bool = True, trip=None, query=None):
         self.passengers = passengers
         self.page = page
         self.dry_run = dry_run
-        self.trip = trip  # 用于在 HTML 查询页填入出发/到达/日期
+        self.trip = trip      # 用于在 HTML 查询页填入出发/到达/日期
+        self.query = query    # TicketQuery 实例，用于站名->电报码转换
 
     def submit(self, train: TrainInfo, seat_type: str, date: str = "") -> bool:
         """对指定车次、席别下单。
@@ -177,26 +178,35 @@ class OrderManager:
             return "(读取失败)"
 
     def _fill_query_form(self, date: str) -> None:
-        """在查询页填入出发地、目的地、日期。"""
+        """填写查询表单：直接给隐藏电报码域与可见文本框赋值。
+
+        关键：12306 查询靠隐藏域 #fromStation/#toStation（电报码）与
+        #train_date（纯日期），而非可见文本框。模拟打字+回车不可靠，
+        故用 JS 直接赋值——电报码复用查询模块已加载的映射。
+        """
         try:
-            from_input = self.page.ele(SEL_FROM_INPUT, timeout=5)
-            to_input = self.page.ele(SEL_TO_INPUT, timeout=5)
-            if from_input:
-                from_input.clear()
-                from_input.input(self.trip.from_station)
-                # 选中下拉联想的第一项
-                self.page.wait(0.5)
-                from_input.input("\n")
-            if to_input:
-                to_input.clear()
-                to_input.input(self.trip.to_station)
-                self.page.wait(0.5)
-                to_input.input("\n")
-            if date:
-                date_input = self.page.ele(SEL_DATE_INPUT, timeout=5)
-                if date_input:
-                    date_input.clear()
-                    date_input.input(date)
+            from_code = self.query.station_code(self.trip.from_station) if self.query else ""
+            to_code = self.query.station_code(self.trip.to_station) if self.query else ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("获取电报码失败：%s", exc)
+            from_code = to_code = ""
+
+        js = """
+        function setVal(id, v){ var e=document.getElementById(id); if(e){ e.value=v; } }
+        setVal('fromStation', arguments[0]);
+        setVal('fromStationText', arguments[1]);
+        setVal('toStation', arguments[2]);
+        setVal('toStationText', arguments[3]);
+        setVal('train_date', arguments[4]);
+        """
+        try:
+            self.page.run_js(
+                js, from_code, self.trip.from_station, to_code, self.trip.to_station, date
+            )
+            logger.info(
+                "已填入查询表单：%s(%s)->%s(%s) 日期=%s",
+                self.trip.from_station, from_code, self.trip.to_station, to_code, date,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("填写查询表单出错：%s", exc)
 
@@ -283,7 +293,7 @@ if __name__ == "__main__":
 
         q = TicketQuery(cfg.trip, page=mgr.page)
         q.load_station_map()
-        om = OrderManager(cfg.passengers, page=mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip)
+        om = OrderManager(cfg.passengers, page=mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip, query=q)
 
         for date in cfg.trip.dates:
             hit = q.find_available(date)
