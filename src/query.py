@@ -1,79 +1,172 @@
 """余票查询。
 
-阶段 2 目标：
-- 将中文站名解析为 12306 站点编码
-- 查询余票并解析车次列表
-- 按配置过滤目标车次与席别
-- 可配置间隔的轮询（含随机抖动）
+复用登录后的浏览器会话直接访问 12306 接口：
+- 加载站名 <-> 电报码映射
+- 通过浏览器会话请求 leftTicket 接口（自带登录 cookie，绕过反爬）
+- 解析车次列表，按配置过滤车次与席别
+- 提供可配置间隔的轮询入口
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .config import Trip
 
 logger = logging.getLogger("auto-grab")
 
-# 12306 余票查询接口（返回车次与各席别余票）
-LEFT_TICKET_URL = "https://kyfw.12306.cn/otn/leftTicket/query"
-# 站名 <-> 站点编码 映射表
+# 站名 <-> 电报码映射表（公开静态资源，无需登录）
 STATION_NAME_URL = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js"
+# 余票查询接口。注意 12306 的 query 接口版本路径偶尔变动（queryZ/queryA 等），
+# 若返回异常可在此调整。
+LEFT_TICKET_URL = (
+    "https://kyfw.12306.cn/otn/leftTicket/query"
+    "?leftTicketDTO.train_date={date}"
+    "&leftTicketDTO.from_station={from_code}"
+    "&leftTicketDTO.to_station={to_code}"
+    "&purpose_codes=ADULT"
+)
+
+# data.result 每行按 "|" 分隔后的字段索引（12306 标准布局）
+IDX_SECRET_STR = 0
+IDX_TRAIN_CODE = 3
+IDX_FROM_CODE = 6
+IDX_TO_CODE = 7
+IDX_DEPART_TIME = 8
+IDX_ARRIVE_TIME = 9
+IDX_DURATION = 10
+# 席别中文名 -> 字段索引
+SEAT_INDEX = {
+    "商务座": 32,   # 商务座/特等座共用
+    "特等座": 32,
+    "一等座": 31,
+    "二等座": 30,
+    "高级软卧": 21,
+    "软卧": 23,     # 软卧/一等卧
+    "动卧": 33,
+    "硬卧": 28,     # 硬卧/二等卧
+    "软座": 24,
+    "硬座": 29,
+    "无座": 26,
+}
+# 表示「无票」的占位值
+_NO_TICKET = {"", "无", "*", "--", "－"}
 
 
 @dataclass
 class TrainInfo:
     """一趟车次的余票信息。"""
 
-    train_code: str          # 车次号，如 G1
-    from_station: str
-    to_station: str
+    train_code: str
+    from_code: str
+    to_code: str
     depart_time: str
     arrive_time: str
     duration: str
-    # 席别 -> 余票状态（"有" / "无" / 具体数字 / "候补"）
-    seats: dict[str, str]
-    # 提交订单所需的原始票据串（secretStr）
+    seats: dict[str, str] = field(default_factory=dict)
     secret_str: str = ""
 
     def bookable_seat(self, preferred: list[str]) -> str | None:
         """按偏好顺序返回第一个有票的席别，无票返回 None。"""
         for seat in preferred:
             status = self.seats.get(seat, "")
-            if status and status not in ("无", "", "*", "--"):
+            if status and status not in _NO_TICKET:
                 return seat
         return None
 
 
 class TicketQuery:
-    """余票查询器。"""
+    """余票查询器。依赖登录后的 DrissionPage 会话。"""
 
     def __init__(self, trip: Trip, page=None):
         self.trip = trip
-        self.page = page  # 复用登录后的 DrissionPage 会话
-        self._station_map: dict[str, str] = {}
+        self.page = page
+        self._name_to_code: dict[str, str] = {}
+        self._code_to_name: dict[str, str] = {}
 
+    # ------------------------------------------------------------------
+    # 站名映射
+    # ------------------------------------------------------------------
     def load_station_map(self) -> None:
-        """加载并缓存站名->编码映射。
+        """加载并缓存站名->电报码映射。"""
+        if self.page is None:
+            raise RuntimeError("查询需要已登录的浏览器会话。")
+        self.page.get(STATION_NAME_URL)
+        raw = self.page.html
+        # 提取 var station_names='...'; 中的内容
+        start = raw.find("'")
+        end = raw.rfind("'")
+        if start == -1 or end <= start:
+            raise ValueError("站名映射格式异常，可能页面已改版。")
+        body = raw[start + 1 : end]
 
-        TODO(阶段2): 拉取 STATION_NAME_URL 并解析为字典。
-        """
-        raise NotImplementedError("阶段 2 实现：加载站点编码表")
+        count = 0
+        for item in body.split("@"):
+            if not item:
+                continue
+            fields = item.split("|")
+            if len(fields) < 5:
+                continue
+            name, code = fields[1], fields[2]
+            self._name_to_code[name] = code
+            self._code_to_name[code] = name
+            count += 1
+        logger.info("已加载 %d 个车站编码。", count)
 
     def station_code(self, name: str) -> str:
-        """将中文站名转为站点编码。"""
-        raise NotImplementedError("阶段 2 实现：站名转编码")
+        """将中文站名转为电报码。"""
+        if not self._name_to_code:
+            self.load_station_map()
+        code = self._name_to_code.get(name)
+        if not code:
+            raise ValueError(f"未找到车站「{name}」的编码，请检查站名是否正确。")
+        return code
 
+    # ------------------------------------------------------------------
+    # 余票查询
+    # ------------------------------------------------------------------
     def query(self, date: str) -> list[TrainInfo]:
-        """查询指定日期的余票，返回过滤后的车次列表。
+        """查询指定日期的余票，返回按 train_codes 过滤后的车次列表。"""
+        if self.page is None:
+            raise RuntimeError("查询需要已登录的浏览器会话。")
 
-        TODO(阶段2):
-          1. 组装查询参数（出发/到达编码、日期）
-          2. 请求 LEFT_TICKET_URL 并解析响应
-          3. 按 trip.train_codes 过滤车次
-        """
-        raise NotImplementedError("阶段 2 实现：余票查询")
+        from_code = self.station_code(self.trip.from_station)
+        to_code = self.station_code(self.trip.to_station)
+        url = LEFT_TICKET_URL.format(date=date, from_code=from_code, to_code=to_code)
+
+        self.page.get(url)
+        payload = self.page.json
+        if not isinstance(payload, dict) or "data" not in payload:
+            logger.warning("余票接口返回异常（可能被反爬拦截或需重新登录）。")
+            return []
+
+        result = (payload.get("data") or {}).get("result") or []
+        trains = [self._parse_row(line) for line in result]
+        trains = [t for t in trains if t is not None]
+
+        # 按配置过滤目标车次
+        if self.trip.train_codes:
+            wanted = set(self.trip.train_codes)
+            trains = [t for t in trains if t.train_code in wanted]
+        return trains
+
+    def _parse_row(self, line: str) -> TrainInfo | None:
+        """解析 data.result 中的一行。"""
+        f = line.split("|")
+        if len(f) <= IDX_DURATION:
+            return None
+        seats = {name: f[idx] for name, idx in SEAT_INDEX.items() if idx < len(f)}
+        return TrainInfo(
+            train_code=f[IDX_TRAIN_CODE],
+            from_code=f[IDX_FROM_CODE],
+            to_code=f[IDX_TO_CODE],
+            depart_time=f[IDX_DEPART_TIME],
+            arrive_time=f[IDX_ARRIVE_TIME],
+            duration=f[IDX_DURATION],
+            seats=seats,
+            secret_str=f[IDX_SECRET_STR],
+        )
 
     def find_available(self, date: str) -> tuple[TrainInfo, str] | None:
         """返回第一个「命中目标车次且有偏好席别余票」的 (车次, 席别)。"""
@@ -82,3 +175,33 @@ class TicketQuery:
             if seat:
                 return train, seat
         return None
+
+
+if __name__ == "__main__":
+    # 查询模块自测入口：
+    #   python -m src.query
+    # 会复用阶段1保存的登录会话，查询配置中的行程并打印余票。
+    from .config import load_config
+    from .login import LoginManager
+    from .utils import setup_logger
+
+    setup_logger()
+    cfg = load_config()
+    mgr = LoginManager(cfg.account, cfg.browser)
+    mgr.start_browser()
+    if not mgr.login():
+        logger.error("登录失败，无法查询。")
+        raise SystemExit(1)
+
+    q = TicketQuery(cfg.trip, page=mgr.page)
+    q.load_station_map()
+    for date in cfg.trip.dates:
+        logger.info("=== 查询 %s %s->%s ===", date, cfg.trip.from_station, cfg.trip.to_station)
+        trains = q.query(date)
+        if not trains:
+            logger.info("无匹配车次或查询失败。")
+        for t in trains:
+            seat_str = "  ".join(f"{k}:{v}" for k, v in t.seats.items() if v not in _NO_TICKET) or "无票"
+            logger.info("%s %s->%s [%s] %s", t.train_code, t.depart_time, t.arrive_time, t.duration, seat_str)
+    input("按回车关闭浏览器……")
+    mgr.close()
