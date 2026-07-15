@@ -109,7 +109,8 @@ class OrderManager:
         try:
             out.write_text(self.page.html, encoding="utf-8")
             url = self.page.url
-            reached = "confirmPassenger" in url or "初次" in self.page.html or "乘车人" in self.page.html
+            # 严格判定:必须URL带confirmPassenger,页面里"乘车人"字样在其他页也可能有,不可靠
+            reached = "confirmPassenger" in url
             logger.info("已转储确认页 HTML 到 %s（当前URL: %s）", out, url)
             logger.info("确认页判定：%s", "已到订单确认页✓" if reached else "疑似未到确认页✗（URL不含confirmPassenger）")
         except Exception as exc:  # noqa: BLE001
@@ -141,10 +142,19 @@ class OrderManager:
             # 诊断：转储查询页真实结构，便于校准
             self._dump_query_page(train.train_code)
             return False
+        url_before = self.page.url
         book.click()
+        # 记录点击后 URL 变化,便于诊断(url_change: text=想匹配的URL片段, exclude=True 表示等URL不再包含此片段)
+        try:
+            self.page.wait.url_change(text=url_before, exclude=True, timeout=8)
+            logger.info("点预订后 URL 已变化：%s", self.page.url)
+        except Exception:  # noqa: BLE001
+            logger.warning("点预订后 URL 未变化(仍为 %s),页面可能被拦截或未跳转。", self.page.url)
 
         # 等待确认页的提交按钮出现，作为跳转成功的判据
-        return self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=15) is not None
+        found = self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10) is not None
+        logger.info("找到提交按钮=%s，当前URL=%s", found, self.page.url)
+        return found
 
     def _dump_query_page(self, train_code: str) -> None:
         """查询页找不到预订按钮时，转储真实 HTML 与关键诊断信号。"""
