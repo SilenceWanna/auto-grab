@@ -105,10 +105,39 @@ class LoginManager:
         )
 
     def close(self) -> None:
-        """关闭浏览器。"""
-        if self.page is not None:
+        """关闭浏览器,同时清理可能残留的子进程,避免进程堆积。"""
+        if self.page is None:
+            return
+        # 先收集浏览器进程的子进程(渲染/GPU/utility 等)
+        child_pids: list[int] = []
+        try:
+            import psutil
+            browser_pid = getattr(self.page, "process_id", None) or getattr(self.page.browser, "process_id", None)
+            if browser_pid:
+                parent = psutil.Process(browser_pid)
+                child_pids = [p.pid for p in parent.children(recursive=True)]
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
             self.page.quit()
-            self.page = None
+        except Exception:  # noqa: BLE001
+            pass
+        self.page = None
+
+        # 主进程 quit 后若子进程仍存活则强杀,防止残留
+        if child_pids:
+            try:
+                import psutil
+                for pid in child_pids:
+                    try:
+                        proc = psutil.Process(pid)
+                        if proc.is_running():
+                            proc.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------
     # 登录
