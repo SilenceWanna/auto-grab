@@ -208,21 +208,22 @@ class OrderManager:
             logger.warning("获取电报码失败：%s", exc)
             from_code = to_code = ""
 
+        # 注意:DrissionPage.run_js 会把 script 整段包在一个函数内执行,
+        # 所以不能用 IIFE(内层的 arguments 会覆盖外层参数);
+        # 用变量形式的函数表达式即可,顶层 arguments 保留传入的参数。
         js = """
-        function setBoth(hiddenId, textId, code, name){
+        var setBoth = function(hiddenId, textId, code, name){
             var h = document.getElementById(hiddenId);
             var t = document.getElementById(textId);
             if(h){ h.value = code; }
             if(t){
                 t.value = name;
                 t.classList.remove('error');
-                // 派发事件让页面 JS 认为用户已选中
                 ['input','change','blur','keyup'].forEach(function(ev){
-                    var e = new Event(ev, {bubbles:true});
-                    t.dispatchEvent(e);
+                    t.dispatchEvent(new Event(ev, {bubbles:true}));
                 });
             }
-        }
+        };
         setBoth('fromStation', 'fromStationText', arguments[0], arguments[1]);
         setBoth('toStation',   'toStationText',   arguments[2], arguments[3]);
         var d = document.getElementById('train_date');
@@ -232,7 +233,18 @@ class OrderManager:
                 d.dispatchEvent(new Event(ev, {bubbles:true}));
             });
         }
+        return document.getElementById('fromStation').value + '|' + document.getElementById('toStation').value + '|' + document.getElementById('train_date').value;
         """
+        try:
+            result = self.page.run_js(
+                js, from_code, self.trip.from_station, to_code, self.trip.to_station, date
+            )
+            logger.info(
+                "已填入查询表单：%s(%s)->%s(%s) 日期=%s  实际DOM值=%s",
+                self.trip.from_station, from_code, self.trip.to_station, to_code, date, result,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("填写查询表单出错：%s", exc)
         try:
             self.page.run_js(
                 js, from_code, self.trip.from_station, to_code, self.trip.to_station, date
