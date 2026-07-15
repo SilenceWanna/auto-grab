@@ -100,7 +100,6 @@ class OrderManager:
         return self._confirm_order()
 
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     def _dump_confirm_page(self) -> None:
         """将当前确认页 HTML 转储到 logs/confirm_page.html，用于校准选择器。"""
         from pathlib import Path
@@ -108,7 +107,10 @@ class OrderManager:
         out.parent.mkdir(exist_ok=True)
         try:
             out.write_text(self.page.html, encoding="utf-8")
-            logger.info("已转储确认页 HTML 到 %s（当前URL: %s）", out, self.page.url)
+            url = self.page.url
+            reached = "confirmPassenger" in url or "初次" in self.page.html or "乘车人" in self.page.html
+            logger.info("已转储确认页 HTML 到 %s（当前URL: %s）", out, url)
+            logger.info("确认页判定：%s", "已到订单确认页✓" if reached else "疑似未到确认页✗（URL不含confirmPassenger）")
         except Exception as exc:  # noqa: BLE001
             logger.warning("转储确认页失败：%s", exc)
 
@@ -191,7 +193,7 @@ class OrderManager:
                 label.click()
                 logger.info("已勾选乘客：%s", name)
             else:
-                logger.warning("未找到乘客「%s」，请确认其在12306常用联系人中。", name)
+                logger.warning("未找到乘客「%s」，请确认其在12306乘车人列表中。", name)
 
     def _select_seat(self, seat_type: str) -> None:
         """选择席别。"""
