@@ -51,6 +51,12 @@ class Browser:
 
 
 @dataclass
+class Order:
+    # 是否干跑：True 时走完下单流程但不点击最终提交（不真实占座），默认安全
+    dry_run: bool = True
+
+
+@dataclass
 class Config:
     account: Account
     trip: Trip
@@ -58,6 +64,7 @@ class Config:
     polling: Polling
     notify: Notify
     browser: Browser
+    order: Order
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
@@ -82,6 +89,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             polling=Polling(**raw.get("polling", {})),
             notify=Notify(**raw.get("notify", {})),
             browser=Browser(**raw.get("browser", {})),
+            order=Order(**raw.get("order", {})),
         )
     except (KeyError, TypeError) as exc:
         raise ValueError(f"配置文件格式有误：{exc}") from exc
