@@ -54,20 +54,55 @@ class LoginManager:
     # 浏览器
     # ------------------------------------------------------------------
     def start_browser(self) -> None:
-        """启动浏览器实例，应用配置中的 headless / binary_path。"""
-        opts = ChromiumOptions()
-        if self.browser_cfg.binary_path:
-            opts.set_browser_path(self.browser_cfg.binary_path)
-        if self.browser_cfg.headless:
-            opts.headless(True)
-        # 使用独立的用户数据目录 + 自动分配端口，与用户日常 Chrome 完全隔离，
-        # 避免接管默认 Profile 导致互相干扰（登录 cookies 也随本 Profile 独立保存）。
-        opts.set_user_data_path(str(BROWSER_PROFILE_DIR))
-        opts.auto_port(True)
-        # 抢票场景下常用的稳定性参数
-        opts.set_argument("--disable-blink-features=AutomationControlled")
-        self.page = ChromiumPage(opts)
-        logger.info("浏览器已启动（独立 Profile: %s）。", BROWSER_PROFILE_DIR)
+        """启动浏览器实例，应用配置中的 headless / binary_path。
+
+        为提高在 Windows 上的稳定性：
+        - 使用独立的用户数据目录（BROWSER_PROFILE_DIR），与日常 Chrome 隔离
+        - 显式指定固定端口而非 auto_port（后者在部分 4.1.x 版本上握手不稳）
+        - 启动失败时清理 Profile 内的 Singleton 锁文件并重试
+        """
+        import shutil
+        BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+        last_err: Exception | None = None
+        for attempt in range(1, 4):
+            opts = ChromiumOptions()
+            if self.browser_cfg.binary_path:
+                opts.set_browser_path(self.browser_cfg.binary_path)
+            if self.browser_cfg.headless:
+                opts.headless(True)
+            opts.set_user_data_path(str(BROWSER_PROFILE_DIR))
+            # 固定但错开常见占用的高位端口(每次重试端口不同,避开残留连接)
+            port = 45500 + attempt * 7
+            opts.set_local_port(port)
+            opts.set_argument("--disable-blink-features=AutomationControlled")
+            try:
+                self.page = ChromiumPage(opts)
+                logger.info(
+                    "浏览器已启动（独立 Profile: %s，端口: %d）。",
+                    BROWSER_PROFILE_DIR, port,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                logger.warning("第 %d 次启动失败：%s。清理锁文件后重试...", attempt, exc)
+                # 清理可能残留的 Singleton 锁,不动 Default 目录里的登录数据
+                for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                    p = BROWSER_PROFILE_DIR / lock
+                    try:
+                        if p.is_symlink() or p.is_file():
+                            p.unlink()
+                        elif p.exists():
+                            shutil.rmtree(p, ignore_errors=True)
+                    except OSError:
+                        pass
+        raise RuntimeError(
+            f"浏览器启动失败(重试 3 次)。最后错误：{last_err}\n"
+            f"可能原因：\n"
+            f"1) 系统上残留了同端口的自动化 chrome 进程,请在任务管理器结束所有 chrome.exe 后重试\n"
+            f"2) Profile 目录被占用: {BROWSER_PROFILE_DIR}\n"
+            f"3) Chrome 版本与 DrissionPage 不兼容"
+        )
 
     def close(self) -> None:
         """关闭浏览器。"""
