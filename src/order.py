@@ -133,7 +133,14 @@ class OrderManager:
         if query_btn:
             query_btn.click()
             self.page.wait.doc_loaded()
-            self.page.wait(1)  # 结果表格异步渲染，稍等
+            self.page.wait(2)  # 结果表格异步渲染，稍等
+        # 诊断:查询后结果表格实际行数(0 表示查询未生效)
+        try:
+            rows = self.page.eles("#queryLeftTable tr", timeout=2)
+            data_rows = [r for r in rows if "datatran" in (r.attr("id") or "") or r.attr("id", "").startswith("ticket_")]
+            logger.info("查询后结果表格总行数=%d, 数据行=%d", len(rows), len(data_rows))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("统计结果表格失败：%s", exc)
 
         # 在车次表格里定位目标车次所在行，点击该行的「预订」
         book = self._find_book_button(train.train_code)
@@ -188,11 +195,11 @@ class OrderManager:
             return "(读取失败)"
 
     def _fill_query_form(self, date: str) -> None:
-        """填写查询表单：直接给隐藏电报码域与可见文本框赋值。
+        """填写查询表单：同时写可见框、隐藏电报码域，并派发 change 事件让页面校验通过。
 
-        关键：12306 查询靠隐藏域 #fromStation/#toStation（电报码）与
-        #train_date（纯日期），而非可见文本框。模拟打字+回车不可靠，
-        故用 JS 直接赋值——电报码复用查询模块已加载的映射。
+        12306 页面 JS 校验较严：单纯给隐藏域赋值时,可见框仍被视为"未选中"
+        (class="error"),查询按钮虽被点击但页面校验会阻止实际请求。
+        故必须同时写入可见框和隐藏域,并派发 change/blur 事件模拟真实用户输入。
         """
         try:
             from_code = self.query.station_code(self.trip.from_station) if self.query else ""
@@ -202,12 +209,29 @@ class OrderManager:
             from_code = to_code = ""
 
         js = """
-        function setVal(id, v){ var e=document.getElementById(id); if(e){ e.value=v; } }
-        setVal('fromStation', arguments[0]);
-        setVal('fromStationText', arguments[1]);
-        setVal('toStation', arguments[2]);
-        setVal('toStationText', arguments[3]);
-        setVal('train_date', arguments[4]);
+        function setBoth(hiddenId, textId, code, name){
+            var h = document.getElementById(hiddenId);
+            var t = document.getElementById(textId);
+            if(h){ h.value = code; }
+            if(t){
+                t.value = name;
+                t.classList.remove('error');
+                // 派发事件让页面 JS 认为用户已选中
+                ['input','change','blur','keyup'].forEach(function(ev){
+                    var e = new Event(ev, {bubbles:true});
+                    t.dispatchEvent(e);
+                });
+            }
+        }
+        setBoth('fromStation', 'fromStationText', arguments[0], arguments[1]);
+        setBoth('toStation',   'toStationText',   arguments[2], arguments[3]);
+        var d = document.getElementById('train_date');
+        if(d){
+            d.value = arguments[4];
+            ['change','blur'].forEach(function(ev){
+                d.dispatchEvent(new Event(ev, {bubbles:true}));
+            });
+        }
         """
         try:
             self.page.run_js(
