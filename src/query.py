@@ -188,20 +188,23 @@ if __name__ == "__main__":
     setup_logger()
     cfg = load_config()
     mgr = LoginManager(cfg.account, cfg.browser)
-    mgr.start_browser()
-    if not mgr.login():
-        logger.error("登录失败，无法查询。")
-        raise SystemExit(1)
+    try:
+        mgr.start_browser()
+        if not mgr.login():
+            logger.error("登录失败，无法查询。")
+            raise SystemExit(1)
 
-    q = TicketQuery(cfg.trip, page=mgr.page)
-    q.load_station_map()
-    for date in cfg.trip.dates:
-        logger.info("=== 查询 %s %s->%s ===", date, cfg.trip.from_station, cfg.trip.to_station)
-        trains = q.query(date)
-        if not trains:
-            logger.info("无匹配车次或查询失败。")
-        for t in trains:
-            seat_str = "  ".join(f"{k}:{v}" for k, v in t.seats.items() if v not in _NO_TICKET) or "无票"
-            logger.info("%s %s->%s [%s] %s", t.train_code, t.depart_time, t.arrive_time, t.duration, seat_str)
-    input("按回车关闭浏览器……")
-    mgr.close()
+        q = TicketQuery(cfg.trip, page=mgr.page)
+        q.load_station_map()
+        for date in cfg.trip.dates:
+            logger.info("=== 查询 %s %s->%s ===", date, cfg.trip.from_station, cfg.trip.to_station)
+            trains = q.query(date)
+            if not trains:
+                logger.info("无匹配车次或查询失败。")
+            for t in trains:
+                seat_str = "  ".join(f"{k}:{v}" for k, v in t.seats.items() if v not in _NO_TICKET) or "无票"
+                logger.info("%s %s->%s [%s] %s", t.train_code, t.depart_time, t.arrive_time, t.duration, seat_str)
+        input("按回车关闭浏览器……")
+    finally:
+        mgr.close()
+        logger.info("浏览器已关闭。")

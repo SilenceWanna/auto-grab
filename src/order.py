@@ -54,12 +54,13 @@ SEAT_TYPE_CODE = {
 class OrderManager:
     """负责命中余票后的下单占座流程。"""
 
-    def __init__(self, passengers: list[str], page=None, dry_run: bool = True):
+    def __init__(self, passengers: list[str], page=None, dry_run: bool = True, trip=None):
         self.passengers = passengers
         self.page = page
         self.dry_run = dry_run
+        self.trip = trip  # 用于在 HTML 查询页填入出发/到达/日期
 
-    def submit(self, train: TrainInfo, seat_type: str) -> bool:
+    def submit(self, train: TrainInfo, seat_type: str, date: str = "") -> bool:
         """对指定车次、席别下单。
 
         dry_run=True 时返回 False（未真实占座），并打印将提交的订单信息。
@@ -74,9 +75,13 @@ class OrderManager:
         )
 
         # 1. 进入预订确认页
-        if not self._open_booking(train):
-            logger.warning("未能进入预订页（余票可能已被抢空）。")
+        if not self._open_booking(train, date):
+            logger.warning("未能进入预订页（余票可能已被抢空或页面未跳转）。")
             return False
+
+        # 干跑模式下转储确认页 HTML，便于校准选择器
+        if self.dry_run:
+            self._dump_confirm_page()
 
         # 2. 勾选乘客
         self._select_passengers()
@@ -95,19 +100,88 @@ class OrderManager:
         return self._confirm_order()
 
     # ------------------------------------------------------------------
-    def _open_booking(self, train: TrainInfo) -> bool:
-        """在查询结果页点击目标车次的「预订」，进入确认页。"""
-        # 在车次行内找「预订」链接。12306 每行预订按钮 id 形如 ticket_<车次序号>，
-        # 用车次号文本所在行内的「预订」定位更稳。
-        row = self.page.ele(f"@text():{train.train_code}", timeout=10)
-        if not row:
-            return False
-        book = self.page.ele("text:预订", timeout=5)
+    # ------------------------------------------------------------------
+    def _dump_confirm_page(self) -> None:
+        """将当前确认页 HTML 转储到 logs/confirm_page.html，用于校准选择器。"""
+        from pathlib import Path
+        out = Path(__file__).resolve().parent.parent / "logs" / "confirm_page.html"
+        out.parent.mkdir(exist_ok=True)
+        try:
+            out.write_text(self.page.html, encoding="utf-8")
+            logger.info("已转储确认页 HTML 到 %s（当前URL: %s）", out, self.page.url)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("转储确认页失败：%s", exc)
+
+    def _open_booking(self, train: TrainInfo, date: str = "") -> bool:
+        """在 HTML 查询页填入行程、查询，然后点击目标车次的「预订」进入确认页。
+
+        关键：必须走 leftTicket/init 的 HTML 页面（而非查询 JSON 接口页），
+        才能看到「预订」按钮并跳转到订单确认页。
+        """
+        self.page.get(LEFT_TICKET_INIT_URL)
+
+        # 填入出发地/目的地/日期（若提供了 trip/date）
+        if self.trip is not None:
+            self._fill_query_form(date)
+
+        # 点击查询
+        query_btn = self.page.ele(SEL_QUERY_BTN, timeout=10)
+        if query_btn:
+            query_btn.click()
+            self.page.wait.doc_loaded()
+
+        # 在车次表格里定位目标车次所在行，点击该行的「预订」
+        book = self._find_book_button(train.train_code)
         if not book:
+            logger.warning("未在查询结果中找到车次 %s 的预订按钮。", train.train_code)
             return False
         book.click()
-        # 等待确认页的提交按钮出现
+
+        # 等待确认页的提交按钮出现，作为跳转成功的判据
         return self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=15) is not None
+
+    def _fill_query_form(self, date: str) -> None:
+        """在查询页填入出发地、目的地、日期。"""
+        try:
+            from_input = self.page.ele(SEL_FROM_INPUT, timeout=5)
+            to_input = self.page.ele(SEL_TO_INPUT, timeout=5)
+            if from_input:
+                from_input.clear()
+                from_input.input(self.trip.from_station)
+                # 选中下拉联想的第一项
+                self.page.wait(0.5)
+                from_input.input("\n")
+            if to_input:
+                to_input.clear()
+                to_input.input(self.trip.to_station)
+                self.page.wait(0.5)
+                to_input.input("\n")
+            if date:
+                date_input = self.page.ele(SEL_DATE_INPUT, timeout=5)
+                if date_input:
+                    date_input.clear()
+                    date_input.input(date)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("填写查询表单出错：%s", exc)
+
+    def _find_book_button(self, train_code: str):
+        """在车次结果表中找到指定车次那一行的「预订」按钮。"""
+        # 每趟车次在表格中有一行，行内含车次号文本与「预订」链接。
+        # 定位车次号元素后，向上找所属行，再在行内找「预订」。
+        code_ele = self.page.ele(f"text:{train_code}", timeout=10)
+        if not code_ele:
+            return None
+        # 车次号所在的 <tr> 行
+        try:
+            row = code_ele.parent("tag:tr")
+        except Exception:  # noqa: BLE001
+            row = None
+        if row:
+            book = row.ele("text:预订", timeout=3)
+            if book:
+                return book
+        # 兜底：全页找预订（可能定位到第一趟，仅在单车次场景可靠）
+        return self.page.ele("text:预订", timeout=3)
 
     def _select_passengers(self) -> None:
         """在确认页按姓名勾选乘客。"""
@@ -165,23 +239,27 @@ if __name__ == "__main__":
     setup_logger()
     cfg = load_config()
     mgr = LoginManager(cfg.account, cfg.browser)
-    mgr.start_browser()
-    if not mgr.login():
-        logger.error("登录失败。")
-        raise SystemExit(1)
+    try:
+        mgr.start_browser()
+        if not mgr.login():
+            logger.error("登录失败。")
+            raise SystemExit(1)
 
-    q = TicketQuery(cfg.trip, page=mgr.page)
-    q.load_station_map()
-    om = OrderManager(cfg.passengers, page=mgr.page, dry_run=cfg.order.dry_run)
+        q = TicketQuery(cfg.trip, page=mgr.page)
+        q.load_station_map()
+        om = OrderManager(cfg.passengers, page=mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip)
 
-    for date in cfg.trip.dates:
-        hit = q.find_available(date)
-        if hit is None:
-            logger.info("%s 无可订余票。", date)
-            continue
-        train, seat = hit
-        logger.info("命中：%s %s %s", date, train.train_code, seat)
-        om.submit(train, seat)
-        break
-    input("按回车关闭浏览器……")
-    mgr.close()
+        for date in cfg.trip.dates:
+            hit = q.find_available(date)
+            if hit is None:
+                logger.info("%s 无可订余票。", date)
+                continue
+            train, seat = hit
+            logger.info("命中：%s %s %s", date, train.train_code, seat)
+            om.submit(train, seat, date=date)
+            break
+        input("按回车关闭浏览器……")
+    finally:
+        # 无论正常结束、异常还是关窗，都确保浏览器进程被回收，避免残留堆积
+        mgr.close()
+        logger.info("浏览器已关闭。")

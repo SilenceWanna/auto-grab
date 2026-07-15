@@ -28,6 +28,8 @@ LOGIN_SUCCESS_URL = "https://kyfw.12306.cn/otn/view/index.html"
 
 SESSION_DIR = Path(__file__).resolve().parent.parent / ".session"
 COOKIES_PATH = SESSION_DIR / "cookies.json"
+# 脚本专用的独立浏览器用户数据目录，与用户日常 Chrome 隔离
+BROWSER_PROFILE_DIR = SESSION_DIR / "browser_profile"
 
 # ---- 页面选择器集中管理（12306 改版时只需在此处维护）----
 SEL_ACCOUNT_LOGIN_TAB = "text:账号登录"   # 从「扫码登录」切换到「账号登录」的标签
@@ -58,10 +60,14 @@ class LoginManager:
             opts.set_browser_path(self.browser_cfg.binary_path)
         if self.browser_cfg.headless:
             opts.headless(True)
+        # 使用独立的用户数据目录 + 自动分配端口，与用户日常 Chrome 完全隔离，
+        # 避免接管默认 Profile 导致互相干扰（登录 cookies 也随本 Profile 独立保存）。
+        opts.set_user_data_path(str(BROWSER_PROFILE_DIR))
+        opts.auto_port(True)
         # 抢票场景下常用的稳定性参数
         opts.set_argument("--disable-blink-features=AutomationControlled")
         self.page = ChromiumPage(opts)
-        logger.info("浏览器已启动。")
+        logger.info("浏览器已启动（独立 Profile: %s）。", BROWSER_PROFILE_DIR)
 
     def close(self) -> None:
         """关闭浏览器。"""
@@ -190,8 +196,11 @@ if __name__ == "__main__":
     setup_logger()
     cfg = load_config()
     mgr = LoginManager(cfg.account, cfg.browser)
-    mgr.start_browser()
-    ok = mgr.login()
-    logger.info("登录自测结果：%s", "成功" if ok else "失败")
-    input("按回车关闭浏览器……")
-    mgr.close()
+    try:
+        mgr.start_browser()
+        ok = mgr.login()
+        logger.info("登录自测结果：%s", "成功" if ok else "失败")
+        input("按回车关闭浏览器……")
+    finally:
+        mgr.close()
+        logger.info("浏览器已关闭。")

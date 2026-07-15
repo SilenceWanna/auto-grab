@@ -39,52 +39,57 @@ def run() -> int:
     login_mgr = LoginManager(cfg.account, cfg.browser)
     notifier = Notifier(cfg.notify)
 
-    # 3. 登录（阶段1接入后启用）
+    # 3. 登录
     login_mgr.start_browser()
-    if not login_mgr.login():
-        logger.error("登录失败，退出。")
-        return 3
+    try:
+        if not login_mgr.login():
+            logger.error("登录失败，退出。")
+            return 3
 
-    query = TicketQuery(cfg.trip, page=login_mgr.page)
-    order_mgr = OrderManager(cfg.passengers, page=login_mgr.page, dry_run=cfg.order.dry_run)
-    query.load_station_map()
+        query = TicketQuery(cfg.trip, page=login_mgr.page)
+        order_mgr = OrderManager(cfg.passengers, page=login_mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip)
+        query.load_station_map()
 
-    # 4. 轮询抢票主循环
-    attempts = 0
-    while True:
-        attempts += 1
-        if cfg.polling.max_attempts and attempts > cfg.polling.max_attempts:
-            logger.info("已达最大尝试次数 %d，退出。", cfg.polling.max_attempts)
-            return 1
+        # 4. 轮询抢票主循环
+        attempts = 0
+        while True:
+            attempts += 1
+            if cfg.polling.max_attempts and attempts > cfg.polling.max_attempts:
+                logger.info("已达最大尝试次数 %d，退出。", cfg.polling.max_attempts)
+                return 1
 
-        for date in cfg.trip.dates:
-            try:
-                if not login_mgr.is_logged_in():
-                    logger.warning("登录态失效，尝试重新登录。")
-                    login_mgr.login()
+            for date in cfg.trip.dates:
+                try:
+                    if not login_mgr.is_logged_in():
+                        logger.warning("登录态失效，尝试重新登录。")
+                        login_mgr.login()
 
-                hit = query.find_available(date)
-                if hit is None:
-                    logger.info("[第 %d 次] %s 暂无余票。", attempts, date)
-                    continue
+                    hit = query.find_available(date)
+                    if hit is None:
+                        logger.info("[第 %d 次] %s 暂无余票。", attempts, date)
+                        continue
 
-                train, seat = hit
-                logger.info("发现余票：%s %s %s，尝试下单。", date, train.train_code, seat)
-                if order_mgr.submit(train, seat):
-                    msg = f"{date} {train.train_code} {seat} 占座成功，请尽快支付！"
-                    logger.info(msg)
-                    notifier.notify_success("抢票成功", msg)
-                    return 0
-                logger.info("下单未成功，继续轮询。")
-            except NotImplementedError as exc:
-                # 骨架阶段：模块尚未实现，提示后退出，避免死循环刷日志
-                logger.error("功能尚未实现：%s", exc)
-                logger.error("当前为项目骨架，请按 WORKPLAN.md 逐阶段实现各模块。")
-                return 4
-            except Exception as exc:  # noqa: BLE001 —— 主循环兜底，防止单点异常退出
-                logger.exception("本轮出现异常，稍后重试：%s", exc)
+                    train, seat = hit
+                    logger.info("发现余票：%s %s %s，尝试下单。", date, train.train_code, seat)
+                    if order_mgr.submit(train, seat, date=date):
+                        msg = f"{date} {train.train_code} {seat} 占座成功，请尽快支付！"
+                        logger.info(msg)
+                        notifier.notify_success("抢票成功", msg)
+                        return 0
+                    logger.info("下单未成功，继续轮询。")
+                except NotImplementedError as exc:
+                    # 骨架阶段：模块尚未实现，提示后退出，避免死循环刷日志
+                    logger.error("功能尚未实现：%s", exc)
+                    logger.error("当前为项目骨架，请按 WORKPLAN.md 逐阶段实现各模块。")
+                    return 4
+                except Exception as exc:  # noqa: BLE001 —— 主循环兜底，防止单点异常退出
+                    logger.exception("本轮出现异常，稍后重试：%s", exc)
 
-        sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
+            sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
+    finally:
+        # 无论何种退出路径都回收浏览器进程，避免残留堆积
+        login_mgr.close()
+        logger.info("浏览器已关闭。")
 
 
 def main() -> None:
