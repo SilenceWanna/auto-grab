@@ -131,16 +131,50 @@ class OrderManager:
         if query_btn:
             query_btn.click()
             self.page.wait.doc_loaded()
+            self.page.wait(1)  # 结果表格异步渲染，稍等
 
         # 在车次表格里定位目标车次所在行，点击该行的「预订」
         book = self._find_book_button(train.train_code)
         if not book:
             logger.warning("未在查询结果中找到车次 %s 的预订按钮。", train.train_code)
+            # 诊断：转储查询页真实结构，便于校准
+            self._dump_query_page(train.train_code)
             return False
         book.click()
 
         # 等待确认页的提交按钮出现，作为跳转成功的判据
         return self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=15) is not None
+
+    def _dump_query_page(self, train_code: str) -> None:
+        """查询页找不到预订按钮时，转储真实 HTML 与关键诊断信号。"""
+        from pathlib import Path
+        out = Path(__file__).resolve().parent.parent / "logs" / "query_page.html"
+        out.parent.mkdir(exist_ok=True)
+        try:
+            html = self.page.html
+            out.write_text(html, encoding="utf-8")
+            logger.info("已转储查询页 HTML 到 %s（当前URL: %s）", out, self.page.url)
+            # 诊断信号
+            from_val = self._input_value(SEL_FROM_INPUT)
+            to_val = self._input_value(SEL_TO_INPUT)
+            date_val = self._input_value(SEL_DATE_INPUT)
+            logger.info("诊断-表单实际值：出发=%r 到达=%r 日期=%r", from_val, to_val, date_val)
+            logger.info("诊断-页面含'预订'字样：%s", "预订" in html)
+            logger.info("诊断-页面含车次%s：%s", train_code, train_code in html)
+            book_eles = self.page.eles("text:预订", timeout=2)
+            logger.info("诊断-'预订'元素个数：%d", len(book_eles))
+            rows = self.page.eles("#queryLeftTable tr", timeout=2)
+            logger.info("诊断-结果表格行数：%d", len(rows))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("转储查询页失败：%s", exc)
+
+    def _input_value(self, selector: str) -> str:
+        """读取输入框当前值，用于诊断表单是否填成功。"""
+        try:
+            ele = self.page.ele(selector, timeout=2)
+            return ele.value if ele else "(未找到该输入框)"
+        except Exception:  # noqa: BLE001
+            return "(读取失败)"
 
     def _fill_query_form(self, date: str) -> None:
         """在查询页填入出发地、目的地、日期。"""
