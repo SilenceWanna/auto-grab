@@ -72,8 +72,10 @@ class LoginManager:
             if self.browser_cfg.headless:
                 opts.headless(True)
             opts.set_user_data_path(str(BROWSER_PROFILE_DIR))
-            # 固定但错开常见占用的高位端口(每次重试端口不同,避开残留连接)
-            port = 45500 + attempt * 7
+            # 使用 9333 附近的常规调试端口。经实测,45000+ 高位端口在部分企业
+            # 环境(如带 EDR/防火墙的机器)会被拦截,而 9333/9222 这类"传统"调试
+            # 端口通常在白名单内。
+            port = 9330 + attempt
             opts.set_local_port(port)
             opts.set_argument("--disable-blink-features=AutomationControlled")
             try:
@@ -85,8 +87,8 @@ class LoginManager:
                 return
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
-                logger.warning("第 %d 次启动失败：%s。清理锁文件后重试...", attempt, exc)
-                # 清理可能残留的 Singleton 锁,不动 Default 目录里的登录数据
+                logger.warning("第 %d 次启动失败：%s。清理后重试...", attempt, exc)
+                # 清理可能残留的 Singleton 锁
                 for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
                     p = BROWSER_PROFILE_DIR / lock
                     try:
@@ -94,6 +96,15 @@ class LoginManager:
                             p.unlink()
                         elif p.exists():
                             shutil.rmtree(p, ignore_errors=True)
+                    except OSError:
+                        pass
+                # 第二次失败后,Profile 可能已被写坏,整体重建
+                # (cookies 存在 SESSION_DIR/cookies.json,不在此目录,不会丢)
+                if attempt >= 2:
+                    try:
+                        shutil.rmtree(BROWSER_PROFILE_DIR, ignore_errors=True)
+                        BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+                        logger.info("已重建 Profile 目录。")
                     except OSError:
                         pass
         raise RuntimeError(

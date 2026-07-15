@@ -1,5 +1,6 @@
 # DrissionPage —— 浏览器自动化与接口请求
-DrissionPage>=4.0.0
+# 注:4.1.1.4 稳定版与 Chrome 150 握手不兼容,须用 4.2.0b9+
+DrissionPage>=4.2.0b9
 
 # PyYAML —— 读取 YAML 配置
 PyYAML>=6.0
