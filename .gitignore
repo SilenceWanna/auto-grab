@@ -15,6 +15,9 @@ env/
 # 用户私有配置（含账号密码，切勿提交）
 config/config.yaml
 
+# PyInstaller 打包中间产物（build/dist 上面已忽略）
+*.spec.bak
+
 # 会话 / cookies 缓存
 *.cookies
 cookies/
