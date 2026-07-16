@@ -135,6 +135,9 @@ class OrderManager:
         查询接口已经返回预订所需的 ``secret_str``。直接调用页面原生函数
         使用的同一接口，绕开查询表单校验以及偶发假阴性的 checkUser 前置
         检查；服务端接受后再进入 ``confirmPassenger/initDc``。
+
+        懒式认证：先直接尝试 submitOrderRequest，只有当接口返回"需要登录"
+        才 restore 一次并重试。避免每次 submit 都强制消耗一次 UAM tk。
         """
         if self.trip is None:
             raise RuntimeError("下单需要行程配置。")
@@ -147,14 +150,55 @@ class OrderManager:
         self.page.wait.doc_loaded()
         self.page.wait(2)
 
-        # 12306 的 checkUser 在负载均衡环境中会偶发假阴性。预订前重新完成
-        # UAM 握手，确保 submitOrderRequest 命中有效的 OTN 会话。
-        if self.login_manager is not None and not self.login_manager.restore_session():
-            # 抛异常让主循环走完整重登(不能 return False,否则同一命中会立即重试
-            # 陷入死循环:命中余票 -> restore 失败 -> return False -> 下轮又命中同一车次...)
-            raise SessionExpired("UAM 会话已失效，需要重新登录")
+        # 先直接尝试提交；若接口回复"需要登录",再 restore 一次并重试。
+        response = self._request_submit_order(train, date)
+        if self._response_needs_relogin(response):
+            logger.info("预订接口提示需要登录，尝试恢复 UAM 会话后重试。")
+            if self.login_manager is None or not self.login_manager.restore_session():
+                raise SessionExpired("UAM 会话已失效，需要重新登录")
+            response = self._request_submit_order(train, date)
 
-        response = self.page.run_js(
+        if not isinstance(response, dict) or not response.get("status"):
+            messages = response.get("messages") if isinstance(response, dict) else []
+            logger.warning(
+                "预订入口请求失败（HTTP=%s，消息=%s）。",
+                response.get("httpStatus") if isinstance(response, dict) else "未知",
+                "；".join(str(message) for message in (messages or [])) or "无",
+            )
+            return False
+
+        logger.info(
+            "预订入口请求成功：%s->%s 日期=%s，准备进入确认页。",
+            self.trip.from_station,
+            self.trip.to_station,
+            date,
+        )
+        self.page.get(CONFIRM_PASSENGER_URL)
+        self.page.wait.doc_loaded()
+        found = (
+            "confirmPassenger" in str(self.page.url)
+            and self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10) is not None
+        )
+        logger.info("已进入订单确认页，提交按钮=%s。", found)
+        return found
+
+    @staticmethod
+    def _response_needs_relogin(response) -> bool:
+        """判断 submitOrderRequest 的响应是否属于"需要重新登录"类失败。"""
+        if not isinstance(response, dict):
+            return False
+        if response.get("status"):
+            return False
+        http = response.get("httpStatus")
+        if http in (401, 403):
+            return True
+        messages = response.get("messages") or []
+        joined = "；".join(str(m) for m in messages)
+        return any(kw in joined for kw in ("请重新登录", "未登录", "登录超时", "登录已失效"))
+
+    def _request_submit_order(self, train: TrainInfo, date: str):
+        """调用 submitOrderRequest 并返回响应 dict。"""
+        return self.page.run_js(
             """
             var params = new URLSearchParams();
             params.set('secretStr', decodeURIComponent(arguments[0]));
@@ -198,29 +242,6 @@ class OrderManager:
             self.trip.from_station,
             self.trip.to_station,
         )
-        if not isinstance(response, dict) or not response.get("status"):
-            messages = response.get("messages") if isinstance(response, dict) else []
-            logger.warning(
-                "预订入口请求失败（HTTP=%s，消息=%s）。",
-                response.get("httpStatus") if isinstance(response, dict) else "未知",
-                "；".join(str(message) for message in (messages or [])) or "无",
-            )
-            return False
-
-        logger.info(
-            "预订入口请求成功：%s->%s 日期=%s，准备进入确认页。",
-            self.trip.from_station,
-            self.trip.to_station,
-            date,
-        )
-        self.page.get(CONFIRM_PASSENGER_URL)
-        self.page.wait.doc_loaded()
-        found = (
-            "confirmPassenger" in str(self.page.url)
-            and self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10) is not None
-        )
-        logger.info("已进入订单确认页，提交按钮=%s。", found)
-        return found
 
     def _select_passengers(self) -> bool:
         """在确认页的乘车人列表中按姓名勾选，并验证订单行已生成。"""
