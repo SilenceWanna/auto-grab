@@ -157,9 +157,16 @@ def run() -> int:
                 consecutive_errors = 0  # 成功一轮就重置
                 sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
     finally:
-        # 无论何种退出路径都回收浏览器进程，避免残留堆积
-        login_mgr.close()
-        logger.info("浏览器已关闭。")
+        # 无论何种退出路径都回收浏览器进程，避免残留堆积。
+        # 用循环 + 屏蔽 KeyboardInterrupt 保证第二次 Ctrl+C 不会打断清理,
+        # 否则浏览器子进程可能残留、"浏览器已关闭"日志也打不出来。
+        while True:
+            try:
+                login_mgr.close()
+                logger.info("浏览器已关闭。")
+                break
+            except KeyboardInterrupt:
+                logger.warning("清理过程被中断,继续尝试关闭浏览器...")
 
 
 def main() -> None:
