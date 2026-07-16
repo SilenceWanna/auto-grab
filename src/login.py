@@ -109,6 +109,25 @@ class LoginManager:
             f"3) Chrome 版本与 DrissionPage 不兼容"
         )
 
+    def is_alive(self) -> bool:
+        """快速检查浏览器 CDP 连接是否还活着（不发网络请求）。"""
+        if self.page is None:
+            return False
+        try:
+            # 读一个已缓存属性,若连接已断会立刻抛
+            _ = self.page.url
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def restart_browser(self) -> None:
+        """浏览器断线自愈:关闭当前实例并重新启动。cookies 与 Profile 保留。"""
+        logger.warning("浏览器连接异常,尝试重启...")
+        self.close()
+        self.start_browser()
+        # 重启后需要重新恢复登录态
+        self.login()
+
     def close(self) -> None:
         """关闭浏览器,同时清理可能残留的子进程,避免进程堆积。"""
         if self.page is None:

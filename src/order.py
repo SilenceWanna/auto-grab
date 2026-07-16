@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import logging
 import time
+
+
+class SessionExpired(RuntimeError):
+    """下单前 UAM 会话恢复失败——需要主循环触发完整重登。"""
 from datetime import date as Date
 
 from .query import TrainInfo
@@ -146,8 +150,9 @@ class OrderManager:
         # 12306 的 checkUser 在负载均衡环境中会偶发假阴性。预订前重新完成
         # UAM 握手，确保 submitOrderRequest 命中有效的 OTN 会话。
         if self.login_manager is not None and not self.login_manager.restore_session():
-            logger.warning("预订前恢复登录会话失败。")
-            return False
+            # 抛异常让主循环走完整重登(不能 return False,否则同一命中会立即重试
+            # 陷入死循环:命中余票 -> restore 失败 -> return False -> 下轮又命中同一车次...)
+            raise SessionExpired("UAM 会话已失效，需要重新登录")
 
         response = self.page.run_js(
             """

@@ -20,10 +20,12 @@ import sys
 import time
 from datetime import datetime
 
+from DrissionPage.errors import PageDisconnectedError
+
 from .config import Schedule, load_config
 from .login import LoginManager
 from .notifier import Notifier
-from .order import OrderManager
+from .order import OrderManager, SessionExpired
 from .query import TicketQuery
 from .utils import next_rush_time, setup_logger, sleep_with_jitter
 
@@ -60,24 +62,33 @@ def _current_phase(sched: Schedule) -> tuple[str, float, float, str]:
     未配置 rush_at 时永远返回 "idle"（行为完全等同阶段5）。
     """
     if not sched.rush_at:
-        return "idle", 0.0, 0.0, ""  # interval 由调用方用 polling.* 兜底
-    nxt = next_rush_time(sched.rush_at)
+        return "idle", 0.0, 0.0, ""
+
+    now = datetime.now()
+    # 先检查是否处于「冲刺窗口」内(某个整点刚过且不超过 rush_duration_seconds)
+    # 不能靠 next_rush_time(它只返回未来整点,11:20:00 那一刻会返回明日 11:20)
+    for t in sched.rush_at:
+        hh, mm = t.split(":")
+        today_target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        elapsed = (now - today_target).total_seconds()
+        if 0 <= elapsed <= sched.rush_duration_seconds:
+            return (
+                "rush",
+                sched.rush_interval_seconds,
+                sched.rush_jitter_seconds,
+                f"冲刺中(距 {t} 已过 {int(elapsed)}s / 共 {sched.rush_duration_seconds}s)",
+            )
+
+    # 未处于冲刺窗口,则算下一个整点还有多久
+    nxt = next_rush_time(sched.rush_at, now=now)
     if nxt is None:
         return "idle", 0.0, 0.0, ""
     target, secs_until = nxt
-    # 冲刺期：整点后 rush_duration 秒内
-    if -sched.rush_duration_seconds <= secs_until <= 0:
-        return (
-            "rush",
-            sched.rush_interval_seconds,
-            sched.rush_jitter_seconds,
-            f"冲刺中(距整点 {int(-secs_until)}s / 共 {sched.rush_duration_seconds}s)",
-        )
-    # 预热期：整点前 prep_seconds 内 -> 等到整点(不空刷)
+    # 预热期
     if 0 < secs_until <= sched.prep_seconds:
         return (
             "prep",
-            secs_until,   # 用这个值直接睡到整点
+            secs_until,
             0.0,
             f"预热等待(距 {target:%H:%M} 还有 {int(secs_until)}s)",
         )
@@ -187,6 +198,45 @@ def run() -> int:
                     logger.error("功能尚未实现：%s", exc)
                     logger.error("当前为项目骨架，请按 WORKPLAN.md 逐阶段实现各模块。")
                     return 4
+                except SessionExpired as exc:
+                    # 下单前 UAM 会话失效——必须走完整重登,否则同一命中会死循环
+                    logger.warning("下单前发现会话失效：%s，尝试完整重登。", exc)
+                    if login_mgr.login():
+                        consecutive_login_fails = 0
+                        logger.info("重登成功，下一轮继续。")
+                    else:
+                        consecutive_login_fails += 1
+                        logger.warning(
+                            "重登失败(连续 %d/%d 次)。",
+                            consecutive_login_fails, MAX_LOGIN_RETRIES,
+                        )
+                        if consecutive_login_fails >= MAX_LOGIN_RETRIES:
+                            logger.error("连续重登失败，放弃退出。")
+                            return 5
+                    # 跳过本日期，让下一轮从查询重新开始
+                    continue
+                except PageDisconnectedError as exc:
+                    # 浏览器 CDP 连接断了(反爬弹窗/资源紧张等),重启浏览器自愈
+                    logger.error("浏览器连接断开：%s，重启浏览器自愈。", exc)
+                    round_had_error = True
+                    try:
+                        login_mgr.restart_browser()
+                        # 重启后 page 是新实例,查询/下单模块内部持有的旧 page 引用失效,
+                        # 重新构造(共享同一 LoginManager)。
+                        query = TicketQuery(cfg.trip, page=login_mgr.page)
+                        order_mgr = OrderManager(
+                            cfg.passengers,
+                            page=login_mgr.page,
+                            dry_run=cfg.order.dry_run,
+                            trip=cfg.trip,
+                            login_manager=login_mgr,
+                        )
+                        query.load_station_map()
+                        logger.info("浏览器重启成功，恢复轮询。")
+                    except Exception as restart_exc:  # noqa: BLE001
+                        logger.exception("重启浏览器失败：%s", restart_exc)
+                        return 6
+                    break  # 本日期跳出本轮,让下一轮完整重试
                 except Exception as exc:  # noqa: BLE001 —— 主循环兜底，防止单点异常退出
                     round_had_error = True
                     logger.exception("本轮出现异常，稍后重试：%s", exc)
