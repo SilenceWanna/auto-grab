@@ -1,7 +1,56 @@
-# 阶段 3 卡点：下单页 UI 触发困境
+# 阶段 3 卡点与解决记录：下单页 UI 触发困境
 
-> **状态**：阶段 3（下单占座）代码骨架完整、诊断链完整，但**无法自动触发 12306 的余票查询**，导致下单流程走不到订单确认页。
-> **本文档**：详细记录卡点的诊断链、已排除项，以及后续可选的三条路线。
+> **状态（2026-07-15）**：卡点已解决，完整 dry-run 已进入真实确认页、写入乘车人并选择席别，最终提交按安全开关跳过。真实占座/排队尚未执行。
+> **本文档**：保留原卡点的诊断链，并记录最终采用的解法与剩余验收项。
+
+## 零、解决结果
+
+### 最终方案
+
+最初验证了查询页真实预订按钮使用的：
+
+```javascript
+window.submitOrderRequest(secretStr, departTime)
+```
+
+但页面函数在调用接口前只执行一次 `checkUser`。现场连续检测得到过 `[true, true, false, true, true]`，说明该检查在当前负载均衡环境中会偶发假阴性并弹出登录框。最终采用同一函数生成的官方请求参数，直接调用接口：
+
+1. 打开 `leftTicket/init`，完成 UAM 会话刷新。
+2. 将阶段 2 的 `secret_str`、日期、站名、单程和成人票参数 POST 到 `leftTicket/submitOrderRequest`。
+3. 服务端返回 `status=true, data="0"` 后进入 `confirmPassenger/initDc`。
+4. 在真实乘车人列表内勾选姓名；学生身份提示按当前 `ADULT` 流程选择成人票。
+5. 为所有订单行设置目标席别，并在 `dry_run=true` 时停在“提交订单”之前。
+
+这条路径仍复用浏览器会话与 12306 官方接口，但不再依赖查询结果表格渲染或不稳定的前置 `checkUser`。
+
+### 同时发现的真实问题
+
+原 `LoginManager.is_logged_in()` 通过 `.login-user` 判断登录，但该容器在未登录页面也存在。现场包裹页面 `jQuery.ajax` 后，官方 `/otn/login/checkUser` 返回 `data.flag=false`，证明此前的“复用本地会话成功”是误判；余票查询无需登录，所以阶段 2 仍会正常工作，掩盖了这个问题。
+
+登录态现已改为调用页面同源 `login/checkUser` 接口。另发现 Chrome 用 `expires=-1` 表示会话 cookie，旧代码却把它作为过期时间注入，导致 `uamtk`、`JSESSIONID`、`tk` 立即失效。现在会话 cookie 不传 `expires`，并在复用时执行 `uamtk → uamauthclient` 握手恢复 OTN 会话。
+
+### 已完成验证
+
+- `python -m unittest discover -s tests -v`：11 项通过。
+- `python -m compileall -q src tests`：通过。
+- 过期 cookies 注入后，新登录检测正确返回 `False`；人工登录一次后可跨浏览器进程完成 UAM 恢复。
+- 页面实测确认存在 `window.submitOrderRequest`，真实预订按钮最终也调用该函数。
+- 本地拦截（未发送）原生函数生成的请求，确认 URL 为 `/otn/leftTicket/submitOrderRequest`，并包含正确的 `train_date`、`back_train_date`、`tour_flag=dc`、`purpose_codes=ADULT`、站名和 `_json_att` 占位；页面会自动解码传入的 `secret_str`。
+
+### 现场验收结果
+
+- 自动恢复 21 条 cookies，无需再次滑块登录。
+- G309 二等座预订入口返回成功并进入真实 `confirmPassenger/initDc`。
+- 正确限定到 `#normal_passenger_id`，避免误点顶部导航用户名。
+- 学生身份乘车人按当前成人票流程处理，订单行成功写入姓名。
+- `seatType_1` 成功设置为二等座代码 `O`。
+- `dry_run=true` 在点击“提交订单”前停止，没有真实占座。
+- dry-run 会检查 `passengerTicketStr`、`oldPassengerStr`、重复提交 token、`key_check_isChange`、`leftTicketStr` 和 `train_location` 的就绪状态，且不输出具体票串。
+- 真实提交代码只点击可见的 `qr_submit_id`，并仅以进入 `payOrder/init` 作为成功；隐藏模板文字不再参与判定。
+
+剩余未执行项只有 `dry_run=false` 后的真实提交、排队和待支付结果判定。
+
+2026-07-16 尝试用次日车次复验新增的最终参数校验，但隔夜 passport 会话已过期且人工验证码等待超时，因此该次 live 复验未执行订单入口；配置文件未修改。
 
 ## 一、卡点现象
 
@@ -17,7 +66,7 @@
 
 **症状**：DOM 里的电报码/日期都对了，但**查询结果表格 0 行**，页面 URL 始终停在 `leftTicket/init`，从未跳到 `confirmPassenger`。
 
-## 二、根因（高置信度）
+## 二、当时的根因判断（已被后续诊断补充）
 
 12306 查询页的"查询"按钮 click handler 有严格的前端校验：
 
@@ -42,7 +91,7 @@
 | 未派发 change 事件 | 加了 input/change/blur/keyup 派发 | ⚠️ 派发了，但查询仍 0 行 |
 | 点错了预订按钮元素 | 表格 0 行，根本没预订按钮可点 | — |
 
-## 四、后续可选的三条路线
+## 四、历史方案评估
 
 ### 路线 A：入发房隔离方案（走接口，绕开页面 UI）
 
@@ -93,4 +142,8 @@
 
 - 2026-07-15：阶段 3 骨架完成，实测卡在查询未生效
 - 2026-07-15：暂停阶段 3，固化阶段 1/2 成果，本文档记录卡点
-- 待定：用户决定走 A/B/C 哪条路线
+- 2026-07-15：发现 `.login-user` 导致登录态假阳性，改用官方 `login/checkUser`
+- 2026-07-15：修复会话 cookie 过期元数据并加入 UAM 会话恢复
+- 2026-07-15：绕过偶发假阴性的页面前置检查，官方预订入口返回成功
+- 2026-07-15：真实确认页乘车人和席别选择完成，完整 dry-run 通过
+- 待完成：经明确授权后验证真实提交、排队和待支付结果

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -136,7 +137,17 @@ class TicketQuery:
         url = LEFT_TICKET_URL.format(date=date, from_code=from_code, to_code=to_code)
 
         self.page.get(url)
-        payload = self.page.json
+        # Chrome 的 JSON viewer 会异步把响应放进 <pre>。DrissionPage.page.json
+        # 默认只等 0.5 秒，接口重定向到 queryG 时偶尔会抢在 <pre> 出现前读取。
+        pre = self.page.ele("t:pre", timeout=3)
+        if not pre:
+            logger.warning("余票接口响应未渲染为 JSON（当前URL：%s）。", self.page.url)
+            return []
+        try:
+            payload = json.loads(pre.text)
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("余票接口返回了无法解析的 JSON（当前URL：%s）。", self.page.url)
+            return []
         if not isinstance(payload, dict) or "data" not in payload:
             logger.warning("余票接口返回异常（可能被反爬拦截或需重新登录）。")
             return []

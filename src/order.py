@@ -1,8 +1,8 @@
 """选座与提交订单。
 
-下单走页面 UI 路径（比接口更稳、能自然带上会话与风控参数）：
-1. 打开余票查询页，填入行程并查询
-2. 在目标车次行点击「预订」
+下单复用 12306 查询页的官方预订接口：
+1. 打开余票查询页并刷新登录会话
+2. 将余票接口返回的 secret_str 提交给 submitOrderRequest 接口
 3. 在确认页勾选乘客、选择席别
 4. 提交订单，处理排队/确认弹窗
 
@@ -13,27 +13,22 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date as Date
 
 from .query import TrainInfo
 
 logger = logging.getLogger("auto-grab")
 
-# 余票查询页（渲染车次表格，每行带预订按钮）
+# 查询页作为同源请求入口；预订成功后进入确认页。
 LEFT_TICKET_INIT_URL = "https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc"
+CONFIRM_PASSENGER_URL = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
+ORDER_CONFIRM_TIMEOUT = 20.0
+ORDER_RESULT_TIMEOUT = 180.0
 
 # ---- 选择器集中管理（12306 改版时只需维护此处）----
-SEL_FROM_INPUT = "#fromStationText"
-SEL_TO_INPUT = "#toStationText"
-SEL_DATE_INPUT = "#train_date"
-SEL_QUERY_BTN = "#query_ticket"
-# 车次表格中每行的预订按钮（按车次号定位所在行）
-SEL_BOOK_BTN_TPL = "@onclick^{code}"  # 兜底，实际用车次文本定位
 # 确认页元素
-SEL_PASSENGER_LABEL_TPL = "text:{name}"      # 乘客勾选项（按姓名文本）
 SEL_SUBMIT_ORDER_BTN = "#submitOrder_id"      # 提交订单按钮
 SEL_CONFIRM_QUEUE_BTN = "#qr_submit_id"       # 排队确认弹窗的确认按钮
-# 席别下拉（确认页），值为 12306 席别代码
-SEL_SEAT_SELECT = "#seatType_1"
 
 # 席别中文名 -> 12306 座位类型代码
 SEAT_TYPE_CODE = {
@@ -54,12 +49,19 @@ SEAT_TYPE_CODE = {
 class OrderManager:
     """负责命中余票后的下单占座流程。"""
 
-    def __init__(self, passengers: list[str], page=None, dry_run: bool = True, trip=None, query=None):
+    def __init__(
+        self,
+        passengers: list[str],
+        page=None,
+        dry_run: bool = True,
+        trip=None,
+        login_manager=None,
+    ):
         self.passengers = passengers
         self.page = page
         self.dry_run = dry_run
-        self.trip = trip      # 用于在 HTML 查询页填入出发/到达/日期
-        self.query = query    # TicketQuery 实例，用于站名->电报码转换
+        self.trip = trip
+        self.login_manager = login_manager
 
     def submit(self, train: TrainInfo, seat_type: str, date: str = "") -> bool:
         """对指定车次、席别下单。
@@ -85,13 +87,20 @@ class OrderManager:
             self._dump_confirm_page()
 
         # 2. 勾选乘客
-        self._select_passengers()
+        if not self._select_passengers():
+            logger.warning("乘车人选择未完成，停止本次下单。")
+            return False
 
         # 3. 选择席别
-        self._select_seat(seat_type)
+        if not self._select_seat(seat_type):
+            logger.warning("席别选择未完成，停止本次下单。")
+            return False
 
         # 4. 提交
         if self.dry_run:
+            if not self._validate_final_payload():
+                logger.warning("最终提交参数未准备完整，干跑验收失败。")
+                return False
             logger.warning(
                 "【干跑模式】已到最终提交前，跳过真实提交。"
                 "确认无误后将 config.yaml 的 order.dry_run 改为 false 才会真实抢票。"
@@ -117,205 +126,345 @@ class OrderManager:
             logger.warning("转储确认页失败：%s", exc)
 
     def _open_booking(self, train: TrainInfo, date: str = "") -> bool:
-        """在 HTML 查询页填入行程、查询，然后点击目标车次的「预订」进入确认页。
+        """调用官方预订入口进入订单确认页。
 
-        关键：必须走 leftTicket/init 的 HTML 页面（而非查询 JSON 接口页），
-        才能看到「预订」按钮并跳转到订单确认页。
+        查询接口已经返回预订所需的 ``secret_str``。直接调用页面原生函数
+        使用的同一接口，绕开查询表单校验以及偶发假阴性的 checkUser 前置
+        检查；服务端接受后再进入 ``confirmPassenger/initDc``。
         """
+        if self.trip is None:
+            raise RuntimeError("下单需要行程配置。")
+        if not date:
+            raise ValueError("下单日期不能为空。")
+        if not train.secret_str:
+            raise ValueError("余票结果缺少 secret_str，无法预订。")
+
         self.page.get(LEFT_TICKET_INIT_URL)
+        self.page.wait.doc_loaded()
+        self.page.wait(2)
 
-        # 填入出发地/目的地/日期（若提供了 trip/date）
-        if self.trip is not None:
-            self._fill_query_form(date)
-
-        # 点击查询
-        query_btn = self.page.ele(SEL_QUERY_BTN, timeout=10)
-        if query_btn:
-            query_btn.click()
-            self.page.wait.doc_loaded()
-            self.page.wait(2)  # 结果表格异步渲染，稍等
-        # 诊断:查询后结果表格实际行数(0 表示查询未生效)
-        try:
-            rows = self.page.eles("#queryLeftTable tr", timeout=2)
-            data_rows = [r for r in rows if "datatran" in (r.attr("id") or "") or r.attr("id", "").startswith("ticket_")]
-            logger.info("查询后结果表格总行数=%d, 数据行=%d", len(rows), len(data_rows))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("统计结果表格失败：%s", exc)
-
-        # 在车次表格里定位目标车次所在行，点击该行的「预订」
-        book = self._find_book_button(train.train_code)
-        if not book:
-            logger.warning("未在查询结果中找到车次 %s 的预订按钮。", train.train_code)
-            # 诊断：转储查询页真实结构，便于校准
-            self._dump_query_page(train.train_code)
+        # 12306 的 checkUser 在负载均衡环境中会偶发假阴性。预订前重新完成
+        # UAM 握手，确保 submitOrderRequest 命中有效的 OTN 会话。
+        if self.login_manager is not None and not self.login_manager.restore_session():
+            logger.warning("预订前恢复登录会话失败。")
             return False
-        url_before = self.page.url
-        book.click()
-        # 记录点击后 URL 变化,便于诊断(url_change: text=想匹配的URL片段, exclude=True 表示等URL不再包含此片段)
-        try:
-            self.page.wait.url_change(text=url_before, exclude=True, timeout=8)
-            logger.info("点预订后 URL 已变化：%s", self.page.url)
-        except Exception:  # noqa: BLE001
-            logger.warning("点预订后 URL 未变化(仍为 %s),页面可能被拦截或未跳转。", self.page.url)
 
-        # 等待确认页的提交按钮出现，作为跳转成功的判据
-        found = self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10) is not None
-        logger.info("找到提交按钮=%s，当前URL=%s", found, self.page.url)
+        response = self.page.run_js(
+            """
+            var params = new URLSearchParams();
+            params.set('secretStr', decodeURIComponent(arguments[0]));
+            params.set('train_date', arguments[1]);
+            params.set('back_train_date', arguments[2]);
+            params.set('tour_flag', 'dc');
+            params.set('purpose_codes', 'ADULT');
+            params.set('query_from_station_name', arguments[3]);
+            params.set('query_to_station_name', arguments[4]);
+            params.set('undefined', '');
+            params.set('bed_level_info', '');
+            params.set('seat_discount_info', '');
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/otn/leftTicket/submitOrderRequest', false);
+            xhr.setRequestHeader(
+                'Content-Type',
+                'application/x-www-form-urlencoded; charset=UTF-8'
+            );
+            xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+            xhr.send(params.toString());
+            if (xhr.status < 200 || xhr.status >= 300) {
+                return {httpStatus: xhr.status, status: false, messages: []};
+            }
+            try {
+                var payload = JSON.parse(xhr.responseText);
+                return {
+                    httpStatus: xhr.status,
+                    status: Boolean(payload.status),
+                    data: payload.data,
+                    messages: payload.messages || [],
+                    validateMessages: payload.validateMessages || {}
+                };
+            } catch (e) {
+                return {httpStatus: xhr.status, status: false, messages: []};
+            }
+            """,
+            train.secret_str,
+            date,
+            Date.today().isoformat(),
+            self.trip.from_station,
+            self.trip.to_station,
+        )
+        if not isinstance(response, dict) or not response.get("status"):
+            messages = response.get("messages") if isinstance(response, dict) else []
+            logger.warning(
+                "预订入口请求失败（HTTP=%s，消息=%s）。",
+                response.get("httpStatus") if isinstance(response, dict) else "未知",
+                "；".join(str(message) for message in (messages or [])) or "无",
+            )
+            return False
+
+        logger.info(
+            "预订入口请求成功：%s->%s 日期=%s，准备进入确认页。",
+            self.trip.from_station,
+            self.trip.to_station,
+            date,
+        )
+        self.page.get(CONFIRM_PASSENGER_URL)
+        self.page.wait.doc_loaded()
+        found = (
+            "confirmPassenger" in str(self.page.url)
+            and self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10) is not None
+        )
+        logger.info("已进入订单确认页，提交按钮=%s。", found)
         return found
 
-    def _dump_query_page(self, train_code: str) -> None:
-        """查询页找不到预订按钮时，转储真实 HTML 与关键诊断信号。"""
-        from pathlib import Path
-        out = Path(__file__).resolve().parent.parent / "logs" / "query_page.html"
-        out.parent.mkdir(exist_ok=True)
-        try:
-            html = self.page.html
-            out.write_text(html, encoding="utf-8")
-            logger.info("已转储查询页 HTML 到 %s（当前URL: %s）", out, self.page.url)
-            # 诊断信号
-            from_val = self._input_value(SEL_FROM_INPUT)
-            to_val = self._input_value(SEL_TO_INPUT)
-            date_val = self._input_value(SEL_DATE_INPUT)
-            logger.info("诊断-表单实际值：出发=%r 到达=%r 日期=%r", from_val, to_val, date_val)
-            logger.info("诊断-页面含'预订'字样：%s", "预订" in html)
-            logger.info("诊断-页面含车次%s：%s", train_code, train_code in html)
-            book_eles = self.page.eles("text:预订", timeout=2)
-            logger.info("诊断-'预订'元素个数：%d", len(book_eles))
-            rows = self.page.eles("#queryLeftTable tr", timeout=2)
-            logger.info("诊断-结果表格行数：%d", len(rows))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("转储查询页失败：%s", exc)
-
-    def _input_value(self, selector: str) -> str:
-        """读取输入框当前值，用于诊断表单是否填成功。"""
-        try:
-            ele = self.page.ele(selector, timeout=2)
-            return ele.value if ele else "(未找到该输入框)"
-        except Exception:  # noqa: BLE001
-            return "(读取失败)"
-
-    def _fill_query_form(self, date: str) -> None:
-        """填写查询表单：同时写可见框、隐藏电报码域，并派发 change 事件让页面校验通过。
-
-        12306 页面 JS 校验较严：单纯给隐藏域赋值时,可见框仍被视为"未选中"
-        (class="error"),查询按钮虽被点击但页面校验会阻止实际请求。
-        故必须同时写入可见框和隐藏域,并派发 change/blur 事件模拟真实用户输入。
-        """
-        try:
-            from_code = self.query.station_code(self.trip.from_station) if self.query else ""
-            to_code = self.query.station_code(self.trip.to_station) if self.query else ""
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("获取电报码失败：%s", exc)
-            from_code = to_code = ""
-
-        # 注意:DrissionPage.run_js 会把 script 整段包在一个函数内执行,
-        # 所以不能用 IIFE(内层的 arguments 会覆盖外层参数);
-        # 用变量形式的函数表达式即可,顶层 arguments 保留传入的参数。
-        js = """
-        var setBoth = function(hiddenId, textId, code, name){
-            var h = document.getElementById(hiddenId);
-            var t = document.getElementById(textId);
-            if(h){ h.value = code; }
-            if(t){
-                t.value = name;
-                t.classList.remove('error');
-                ['input','change','blur','keyup'].forEach(function(ev){
-                    t.dispatchEvent(new Event(ev, {bubbles:true}));
+    def _select_passengers(self) -> bool:
+        """在确认页的乘车人列表中按姓名勾选，并验证订单行已生成。"""
+        result = self.page.run_js(
+            """
+            var wanted = Array.from(arguments);
+            var labels = Array.from(
+                document.querySelectorAll('#normal_passenger_id label')
+            );
+            var missing = [];
+            var matched = [];
+            var adultOverrides = [];
+            wanted.forEach(function(name) {
+                var label = labels.find(function(candidate) {
+                    var text = candidate.textContent.trim();
+                    return text === name || text.indexOf(name + '(') === 0;
                 });
-            }
-        };
-        setBoth('fromStation', 'fromStationText', arguments[0], arguments[1]);
-        setBoth('toStation',   'toStationText',   arguments[2], arguments[3]);
-        var d = document.getElementById('train_date');
-        if(d){
-            d.value = arguments[4];
-            ['change','blur'].forEach(function(ev){
-                d.dispatchEvent(new Event(ev, {bubbles:true}));
+                if (!label) {
+                    missing.push(name);
+                    return;
+                }
+                var checkbox = document.getElementById(label.htmlFor);
+                if (checkbox && !checkbox.checked) {
+                    label.click();
+                }
+                // 当前流程固定购买成人票（purpose_codes=ADULT）。学生身份的
+                // 乘车人会弹出是否购买学生票的确认框，点“取消”即按成人票继续。
+                var studentCancel = document.getElementById(
+                    'dialog_xsertcj_cancel'
+                );
+                if (studentCancel && studentCancel.offsetParent !== null) {
+                    studentCancel.click();
+                    adultOverrides.push(name);
+                }
+                matched.push(name);
             });
-        }
-        return document.getElementById('fromStation').value + '|' + document.getElementById('toStation').value + '|' + document.getElementById('train_date').value;
-        """
-        try:
-            result = self.page.run_js(
-                js, from_code, self.trip.from_station, to_code, self.trip.to_station, date
-            )
+            return {
+                matched: matched,
+                missing: missing,
+                adultOverrides: adultOverrides
+            };
+            """,
+            *self.passengers,
+        )
+        if not isinstance(result, dict):
+            logger.warning("读取乘车人列表失败。")
+            return False
+
+        for name in result.get("missing") or []:
+            logger.warning("未找到乘车人「%s」，请确认其在12306乘车人列表中。", name)
+        if result.get("missing"):
+            return False
+        if result.get("adultOverrides"):
             logger.info(
-                "已填入查询表单：%s(%s)->%s(%s) 日期=%s  实际DOM值=%s",
-                self.trip.from_station, from_code, self.trip.to_station, to_code, date, result,
+                "学生身份乘车人按成人票处理：%s",
+                ",".join(result["adultOverrides"]),
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("填写查询表单出错：%s", exc)
-        try:
-            self.page.run_js(
-                js, from_code, self.trip.from_station, to_code, self.trip.to_station, date
-            )
-            logger.info(
-                "已填入查询表单：%s(%s)->%s(%s) 日期=%s",
-                self.trip.from_station, from_code, self.trip.to_station, to_code, date,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("填写查询表单出错：%s", exc)
 
-    def _find_book_button(self, train_code: str):
-        """在车次结果表中找到指定车次那一行的「预订」按钮。"""
-        # 每趟车次在表格中有一行，行内含车次号文本与「预订」链接。
-        # 定位车次号元素后，向上找所属行，再在行内找「预订」。
-        code_ele = self.page.ele(f"text:{train_code}", timeout=10)
-        if not code_ele:
-            return None
-        # 车次号所在的 <tr> 行
-        try:
-            row = code_ele.parent("tag:tr")
-        except Exception:  # noqa: BLE001
-            row = None
-        if row:
-            book = row.ele("text:预订", timeout=3)
-            if book:
-                return book
-        # 兜底：全页找预订（可能定位到第一趟，仅在单车次场景可靠）
-        return self.page.ele("text:预订", timeout=3)
+        self.page.wait(0.5)
+        selected_names = self.page.run_js(
+            """
+            return Array.from(
+                document.querySelectorAll('input[id^="passenger_name_"]')
+            ).filter(function(input) {
+                return /^passenger_name_[0-9]+$/.test(input.id) && input.value;
+            }).map(function(input) {
+                return input.value;
+            });
+            """
+        )
+        selected = set(selected_names or [])
+        missing_rows = [name for name in self.passengers if name not in selected]
+        if missing_rows:
+            logger.warning("乘车人已点击但未写入订单行：%s", ",".join(missing_rows))
+            return False
 
-    def _select_passengers(self) -> None:
-        """在确认页按姓名勾选乘客。"""
-        for name in self.passengers:
-            label = self.page.ele(SEL_PASSENGER_LABEL_TPL.format(name=name), timeout=5)
-            if label:
-                label.click()
-                logger.info("已勾选乘客：%s", name)
-            else:
-                logger.warning("未找到乘客「%s」，请确认其在12306乘车人列表中。", name)
+        logger.info("已勾选乘车人：%s", ",".join(self.passengers))
+        return True
 
-    def _select_seat(self, seat_type: str) -> None:
-        """选择席别。"""
+    def _select_seat(self, seat_type: str) -> bool:
+        """为所有已选择乘车人的订单行设置席别。"""
         code = SEAT_TYPE_CODE.get(seat_type)
-        select = self.page.ele(SEL_SEAT_SELECT, timeout=5)
-        if select and code:
-            try:
-                select.select.by_value(code)
-                logger.info("已选择席别：%s", seat_type)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("选择席别失败：%s（将使用默认席别）", exc)
+        if not code:
+            logger.warning("不支持的席别：%s", seat_type)
+            return False
+
+        result = self.page.run_js(
+            """
+            var code = arguments[0];
+            var selects = Array.from(
+                document.querySelectorAll('select[id^="seatType_"]')
+            ).filter(function(select) {
+                return /^seatType_[0-9]+$/.test(select.id);
+            });
+            var unavailable = [];
+            selects.forEach(function(select) {
+                var available = Array.from(select.options).some(function(option) {
+                    return option.value === code;
+                });
+                if (!available) {
+                    unavailable.push(select.id);
+                    return;
+                }
+                select.value = code;
+                select.dispatchEvent(new Event('change', {bubbles: true}));
+            });
+            return {
+                count: selects.length,
+                unavailable: unavailable,
+                values: selects.map(function(select) { return select.value; })
+            };
+            """,
+            code,
+        )
+        if not isinstance(result, dict) or not result.get("count"):
+            logger.warning("确认页没有可设置的席别下拉框。")
+            return False
+        if result.get("unavailable") or any(
+            value != code for value in (result.get("values") or [])
+        ):
+            logger.warning("席别「%s」不适用于全部乘车人。", seat_type)
+            return False
+
+        logger.info("已为 %d 名乘车人选择席别：%s", result["count"], seat_type)
+        return True
+
+    def _validate_final_payload(self) -> bool:
+        """验证确认页已具备最终提交参数，不返回或记录乘车人敏感信息。"""
+        result = self.page.run_js(
+            """
+            var info = window.ticketInfoForPassengerForm || {};
+            var passengerTicket = typeof window.getpassengerTickets === 'function'
+                ? window.getpassengerTickets() : '';
+            var oldPassenger = typeof window.getOldPassengers === 'function'
+                ? window.getOldPassengers() : '';
+            var rows = Array.from(
+                document.querySelectorAll('input[id^="passenger_name_"]')
+            ).filter(function(input) {
+                return /^passenger_name_[0-9]+$/.test(input.id) && input.value;
+            });
+            return {
+                passengerCount: rows.length,
+                passengerTicketReady: Boolean(passengerTicket),
+                oldPassengerReady: Boolean(oldPassenger),
+                repeatTokenReady: Boolean(window.globalRepeatSubmitToken),
+                keyReady: Boolean(info.key_check_isChange),
+                leftTicketReady: Boolean(info.leftTicketStr),
+                trainLocationReady: Boolean(info.train_location)
+            };
+            """
+        )
+        required = (
+            "passengerTicketReady",
+            "oldPassengerReady",
+            "repeatTokenReady",
+            "keyReady",
+            "leftTicketReady",
+            "trainLocationReady",
+        )
+        valid = (
+            isinstance(result, dict)
+            and result.get("passengerCount") == len(self.passengers)
+            and all(result.get(key) for key in required)
+        )
+        if valid:
+            logger.info("最终提交参数校验通过（乘车人数=%d）。", len(self.passengers))
+        else:
+            logger.warning("最终提交参数校验未通过：%s", result)
+        return bool(valid)
+
+    def _visible_order_messages(self) -> list[str]:
+        """读取当前可见的订单弹窗文本，用于判错，不读取隐藏模板。"""
+        messages = self.page.run_js(
+            """
+            return Array.from(
+                document.querySelectorAll('.dhtmlx_wins_body_outer,.up-box')
+            ).filter(function(element) {
+                var style = getComputedStyle(element);
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && element.offsetParent !== null;
+            }).map(function(element) {
+                return element.innerText.trim();
+            }).filter(Boolean);
+            """
+        )
+        return [str(message) for message in (messages or [])]
+
+    @staticmethod
+    def _is_displayed(element) -> bool:
+        if not element:
+            return False
+        try:
+            return bool(element.states.is_displayed)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _confirm_order(self) -> bool:
-        """真实提交订单，处理排队确认弹窗。"""
+        """真实提交订单，处理排队确认弹窗并严格等待待支付页。"""
+        if not self._validate_final_payload():
+            logger.error("最终提交参数不完整，拒绝提交订单。")
+            return False
+
         submit = self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10)
         if not submit:
             logger.error("未找到提交订单按钮。")
             return False
         submit.click()
 
-        # 排队确认弹窗
-        confirm = self.page.ele(SEL_CONFIRM_QUEUE_BTN, timeout=10)
-        if confirm:
-            confirm.click()
+        confirm = None
+        deadline = time.monotonic() + ORDER_CONFIRM_TIMEOUT
+        while time.monotonic() < deadline:
+            candidate = self.page.ele(SEL_CONFIRM_QUEUE_BTN, timeout=0.5)
+            if self._is_displayed(candidate):
+                confirm = candidate
+                break
+            time.sleep(0.2)
+        if confirm is None:
+            logger.error(
+                "提交订单后未出现可见的排队确认框：%s",
+                "；".join(self._visible_order_messages()) or "无页面提示",
+            )
+            return False
 
-        # 等待跳转到排队/支付页
-        time.sleep(3)
-        # 出现「候补」「支付」等字样视为进入下一步
-        if self.page.ele("text:支付", timeout=10) or self.page.ele("text:排队", timeout=3):
-            logger.info("订单已提交，进入待支付/排队。")
-            return True
-        logger.warning("提交后未检测到支付/排队页，下单可能失败。")
+        confirm.click()
+        logger.info("已确认提交，等待排队结果。")
+
+        failure_words = ("订票失败", "出票失败", "无法提交", "网络忙", "订单已撤销")
+        deadline = time.monotonic() + ORDER_RESULT_TIMEOUT
+        while time.monotonic() < deadline:
+            url = str(self.page.url)
+            if "payOrder/init" in url:
+                logger.info("订单已进入待支付页。")
+                return True
+            messages = self._visible_order_messages()
+            failure = next(
+                (
+                    message
+                    for message in messages
+                    if any(word in message for word in failure_words)
+                ),
+                None,
+            )
+            if failure:
+                logger.error("订单提交失败：%s", failure)
+                return False
+            time.sleep(1)
+
+        logger.warning("等待待支付页超时（当前URL=%s）。", self.page.url)
         return False
 
 
@@ -339,7 +488,13 @@ if __name__ == "__main__":
 
         q = TicketQuery(cfg.trip, page=mgr.page)
         q.load_station_map()
-        om = OrderManager(cfg.passengers, page=mgr.page, dry_run=cfg.order.dry_run, trip=cfg.trip, query=q)
+        om = OrderManager(
+            cfg.passengers,
+            page=mgr.page,
+            dry_run=cfg.order.dry_run,
+            trip=cfg.trip,
+            login_manager=mgr,
+        )
 
         for date in cfg.trip.dates:
             hit = q.find_available(date)
