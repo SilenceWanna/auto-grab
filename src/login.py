@@ -174,16 +174,16 @@ class LoginManager:
         if self.page is None:
             raise RuntimeError("请先调用 start_browser()。")
 
-        # 1. 尝试复用已保存的会话。12306 的 otn 登录态需要用
-        # passport token 完成一次 UAM 握手，单纯注入 cookies 不足以恢复。
+        # 1. 尝试复用已保存的会话。
+        # 只信 restore_session 的结果——它做了完整的 UAM 握手,能验证 tk 还能用。
+        # is_logged_in 只查 checkUser,当 UAM tk 已过期而 checkUser 还有效时会假阳性,
+        # 导致后续 order 每次都会因 restore 失败抛 SessionExpired。
         if self._load_cookies():
-            logged_in = self.restore_session()
-            if not logged_in:
-                logged_in = self.is_logged_in()
-            if logged_in:
+            if self.restore_session():
                 logger.info("已复用本地会话，无需重新登录。")
                 self._save_cookies()
                 return True
+            logger.info("本地 cookies 已存在但 UAM 握手失败,走账密登录。")
 
         # 2. 账号密码登录
         logger.info("开始账号密码登录。")
@@ -214,13 +214,16 @@ class LoginManager:
             # TODO(进阶): 接入第三方打码平台自动识别验证码
             logger.warning("未开启人工验证码，且暂未接入自动打码，可能无法通过验证。")
 
-        # 4. 判断登录结果
-        if self.is_logged_in():
+        # 4. 判断登录结果。
+        # 必须两个都通过:is_logged_in 确认账号态已建立(passport cookie),
+        # restore_session 确认 UAM tk 能被 otn 会话接受。
+        # 只信 is_logged_in 会假阳性:tk 已过期时 checkUser 可能仍返回登录态。
+        if self.is_logged_in() and self.restore_session():
             logger.info("登录成功。")
             self._save_cookies()
             return True
 
-        logger.error("登录失败，请检查账号密码或验证码。")
+        logger.error("登录失败，请检查账号密码或验证码(或 UAM 握手未完成)。")
         return False
 
     def restore_session(self) -> bool:
