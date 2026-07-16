@@ -26,7 +26,7 @@ from .config import Schedule, load_config
 from .login import LoginManager
 from .notifier import Notifier
 from .order import OrderManager, SessionExpired
-from .query import TicketQuery
+from .query import TicketQuery, is_beyond_pre_sale
 from .utils import lookup_release_time, next_rush_time, setup_logger, sleep_with_jitter
 
 logger = setup_logger()
@@ -150,6 +150,7 @@ def run() -> int:
         consecutive_errors = 0        # 连续出错次数（用于指数退避）
         consecutive_login_fails = 0    # 连续重登失败次数（达到 MAX 则放弃）
         last_phase = ""                # 上一轮的阶段（用于状态切换时打日志）
+        announced_pre_sale: set[str] = set()  # 已提示"等待开票"的日期,避免刷屏
         while True:
             attempts += 1
             if cfg.polling.max_attempts and attempts > cfg.polling.max_attempts:
@@ -195,6 +196,15 @@ def run() -> int:
 
                     hit = query.find_available(date)
                     if hit is None:
+                        # 超预售期的日期静默等待,首次提示一次,后续不再刷屏
+                        if is_beyond_pre_sale(date):
+                            if date not in announced_pre_sale:
+                                logger.info(
+                                    "[第 %d 次] %s 尚未开票(超出预售期),脚本会持续等到该日期开票。",
+                                    attempts, date,
+                                )
+                                announced_pre_sale.add(date)
+                            continue
                         logger.info("[第 %d 次] %s 暂无余票。", attempts, date)
                         continue
 
