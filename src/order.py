@@ -198,6 +198,10 @@ class OrderManager:
 
     def _request_submit_order(self, train: TrainInfo, date: str):
         """调用 submitOrderRequest 并返回响应 dict。"""
+        from .query import TICKET_TYPE_CODES
+        purpose_codes = TICKET_TYPE_CODES.get(
+            self.trip.ticket_type if self.trip else "adult", "ADULT",
+        )
         return self.page.run_js(
             """
             var params = new URLSearchParams();
@@ -205,7 +209,7 @@ class OrderManager:
             params.set('train_date', arguments[1]);
             params.set('back_train_date', arguments[2]);
             params.set('tour_flag', 'dc');
-            params.set('purpose_codes', 'ADULT');
+            params.set('purpose_codes', arguments[5]);
             params.set('query_from_station_name', arguments[3]);
             params.set('query_to_station_name', arguments[4]);
             params.set('undefined', '');
@@ -241,18 +245,27 @@ class OrderManager:
             Date.today().isoformat(),
             self.trip.from_station,
             self.trip.to_station,
+            purpose_codes,
         )
 
     def _select_passengers(self) -> bool:
-        """在确认页的乘车人列表中按姓名勾选，并验证订单行已生成。"""
+        """在确认页的乘车人列表中按姓名勾选，并验证订单行已生成。
+
+        票种由 self.trip.ticket_type 决定:
+        - "adult" (默认): 学生身份乘车人弹窗时点击取消,按成人票继续
+        - "student": 点击确认,按学生票购买(乘车人必须已在12306认证为学生身份)
+        """
+        want_student = self.trip is not None and self.trip.ticket_type == "student"
         result = self.page.run_js(
             """
-            var wanted = Array.from(arguments);
+            var wantStudent = arguments[0];
+            var wanted = Array.from(arguments).slice(1);
             var labels = Array.from(
                 document.querySelectorAll('#normal_passenger_id label')
             );
             var missing = [];
             var matched = [];
+            var studentOverrides = [];
             var adultOverrides = [];
             wanted.forEach(function(name) {
                 var label = labels.find(function(candidate) {
@@ -267,23 +280,30 @@ class OrderManager:
                 if (checkbox && !checkbox.checked) {
                     label.click();
                 }
-                // 当前流程固定购买成人票（purpose_codes=ADULT）。学生身份的
-                // 乘车人会弹出是否购买学生票的确认框，点“取消”即按成人票继续。
-                var studentCancel = document.getElementById(
-                    'dialog_xsertcj_cancel'
-                );
-                if (studentCancel && studentCancel.offsetParent !== null) {
-                    studentCancel.click();
-                    adultOverrides.push(name);
+                // 学生身份的乘车人被勾选时,12306 会弹出"是否购买学生票"确认框。
+                // adult 模式点取消(按成人票继续),student 模式点确认(按学生票购买)。
+                var btnId = wantStudent
+                    ? 'dialog_xsertcj_ok'
+                    : 'dialog_xsertcj_cancel';
+                var btn = document.getElementById(btnId);
+                if (btn && btn.offsetParent !== null) {
+                    btn.click();
+                    if (wantStudent) {
+                        studentOverrides.push(name);
+                    } else {
+                        adultOverrides.push(name);
+                    }
                 }
                 matched.push(name);
             });
             return {
                 matched: matched,
                 missing: missing,
+                studentOverrides: studentOverrides,
                 adultOverrides: adultOverrides
             };
             """,
+            want_student,
             *self.passengers,
         )
         if not isinstance(result, dict):
@@ -298,6 +318,11 @@ class OrderManager:
             logger.info(
                 "学生身份乘车人按成人票处理：%s",
                 ",".join(result["adultOverrides"]),
+            )
+        if result.get("studentOverrides"):
+            logger.info(
+                "已确认购买学生票：%s",
+                ",".join(result["studentOverrides"]),
             )
 
         self.page.wait(0.5)

@@ -12,22 +12,34 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import date as date_type
+from datetime import datetime
 
 from .config import Trip
 
 logger = logging.getLogger("auto-grab")
 
+# 12306 官方公告的预售期天数(2025 年恢复至 15 天,此前一度调整为 30 天/60 天)。
+# 若官方调整,只需改这一个常量。
+PRE_SALE_DAYS = 15
+
 # 站名 <-> 电报码映射表（公开静态资源，无需登录）
 STATION_NAME_URL = "https://kyfw.12306.cn/otn/resources/js/framework/station_name.js"
 # 余票查询接口。注意 12306 的 query 接口版本路径偶尔变动（queryZ/queryA 等），
-# 若返回异常可在此调整。
+# 若返回异常可在此调整。购票种类 purpose_codes：ADULT=成人票, 0X00=学生票。
 LEFT_TICKET_URL = (
     "https://kyfw.12306.cn/otn/leftTicket/query"
     "?leftTicketDTO.train_date={date}"
     "&leftTicketDTO.from_station={from_code}"
     "&leftTicketDTO.to_station={to_code}"
-    "&purpose_codes=ADULT"
+    "&purpose_codes={purpose_codes}"
 )
+
+# 票种 -> 12306 purpose_codes
+TICKET_TYPE_CODES = {
+    "adult": "ADULT",
+    "student": "0X00",
+}
 
 # data.result 每行按 "|" 分隔后的字段索引（12306 标准布局）
 IDX_SECRET_STR = 0
@@ -75,6 +87,25 @@ class TrainInfo:
             if status and status not in _NO_TICKET:
                 return seat
         return None
+
+
+def is_beyond_pre_sale(target_date: str, today: date_type | None = None) -> bool:
+    """判定 target_date(YYYY-MM-DD)是否超出 12306 预售期(距今 > PRE_SALE_DAYS 天)。
+
+    Args:
+        target_date: 目标乘车日期,格式 YYYY-MM-DD。
+        today: 参考"今天"(便于测试注入),默认取系统当前日期。
+
+    Returns:
+        True 表示超出预售期,当前查询必然为空。
+    """
+    if today is None:
+        today = date_type.today()
+    try:
+        target = datetime.strptime(target_date, "%Y-%m-%d").date()
+    except ValueError:
+        return False  # 日期格式错误,交由后续逻辑报错
+    return (target - today).days > PRE_SALE_DAYS
 
 
 class TicketQuery:
@@ -132,9 +163,18 @@ class TicketQuery:
         if self.page is None:
             raise RuntimeError("查询需要已登录的浏览器会话。")
 
+        # 若日期超出 12306 预售期,直接返回空(避免向服务端发送必然无结果的请求)。
+        # 由主循环负责根据 schedule 等待放票时刻。
+        if is_beyond_pre_sale(date):
+            logger.debug("%s 尚未开票(超出预售期 %d 天),跳过查询。", date, PRE_SALE_DAYS)
+            return []
+
         from_code = self.station_code(self.trip.from_station)
         to_code = self.station_code(self.trip.to_station)
-        url = LEFT_TICKET_URL.format(date=date, from_code=from_code, to_code=to_code)
+        purpose_codes = TICKET_TYPE_CODES.get(self.trip.ticket_type, "ADULT")
+        url = LEFT_TICKET_URL.format(
+            date=date, from_code=from_code, to_code=to_code, purpose_codes=purpose_codes,
+        )
 
         self.page.get(url)
         # Chrome 的 JSON viewer 会异步把响应放进 <pre>。DrissionPage.page.json

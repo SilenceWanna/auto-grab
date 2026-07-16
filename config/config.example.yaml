@@ -17,6 +17,7 @@ trip:
   from_station: "北京"           # 出发地（中文站名）
   to_station: "上海"             # 目的地（中文站名）
   # 乘车日期，可填多个（按顺序尝试），格式 YYYY-MM-DD
+  # 超出 12306 预售期(默认15天)的日期,脚本会静默等待,直到该日期开票才真正查询
   dates:
     - "2026-02-01"
   # 目标车次，留空表示所有车次；填写则只抢这些车次
@@ -29,6 +30,9 @@ trip:
     - "一等座"
   # 是否接受候补（暂未实现，预留）
   allow_candidate: false
+  # 票种:adult(成人票,默认) / student(学生票)
+  # 学生票要求所有乘车人在12306已经完成学生身份认证,且行程在学生优惠范围内。
+  ticket_type: "adult"
 
 # ---------- 乘客 ----------
 # 姓名需与 12306 乘车人（原“常用联系人”）完全一致
@@ -64,12 +68,17 @@ order:
   dry_run: true
 
 # ---------- 放票整点调度（可选）----------
-# 留空 rush_at 时脚本行为与阶段5相同（一直按 polling.interval_seconds 慢刷）。
+# 留空 rush_at 且 auto=false 时脚本行为与阶段5相同（一直按 polling.interval_seconds 慢刷）。
 # 填写后：整点前 prep_seconds 内静等到整点、整点后 rush_duration_seconds 内高频冲刺，
 # 其他时段仍按 polling.interval_seconds 慢刷（防止错过意外余票）。
 schedule:
-  # 每日放票时间点（HH:MM），常见批次：08:00 / 13:00 / 18:30 等，按你要抢的车站实际放票时间填。
+  # 每日放票时间点（HH:MM），常见批次：08:00 / 13:00 / 18:30 等
+  # 手写 rush_at 优先;为空且 auto=true 时,脚本根据 trip.from_station 自动查内置表填入。
   rush_at: []                     # 例如 ["13:00"]
+  # 自动查询放票时间:根据 trip.from_station 从内置表查出该站放票时刻。
+  # 88 个大站已内置(北京 08:00 / 上海 08:00 / 广州 08:00 / 桂林 16:00 等),
+  # 不在表内的站会提示手动填 rush_at。
+  auto: true
   prep_seconds: 60                # 整点前多少秒开始预热（静等到整点）
   rush_duration_seconds: 180      # 整点后高频冲刺持续多少秒（默认 3 分钟）
   rush_interval_seconds: 0.3      # 冲刺时的查询间隔（越小越快，但被限流风险越高）

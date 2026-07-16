@@ -27,7 +27,7 @@ from .login import LoginManager
 from .notifier import Notifier
 from .order import OrderManager, SessionExpired
 from .query import TicketQuery
-from .utils import next_rush_time, setup_logger, sleep_with_jitter
+from .utils import lookup_release_time, next_rush_time, setup_logger, sleep_with_jitter
 
 logger = setup_logger()
 
@@ -106,6 +106,23 @@ def run() -> int:
     except (FileNotFoundError, ValueError) as exc:
         logger.error("配置加载失败：%s", exc)
         return 2
+
+    # 自动查询放票时刻:仅当 schedule.auto=True 且 rush_at 为空时,
+    # 根据 trip.from_station 从内置表查出放票时间。手写 rush_at 优先。
+    if cfg.schedule.auto and not cfg.schedule.rush_at:
+        release = lookup_release_time(cfg.trip.from_station)
+        if release:
+            cfg.schedule.rush_at = [release]
+            logger.info(
+                "[调度] 已自动查出 %s 的放票时刻:%s(可在 config.yaml 手动覆盖 schedule.rush_at)",
+                cfg.trip.from_station, release,
+            )
+        else:
+            logger.warning(
+                "[调度] schedule.auto=true 但内置表未收录 %s 的放票时刻,"
+                "请手动填 schedule.rush_at,或去 12306 查询该站放票时间。",
+                cfg.trip.from_station,
+            )
 
     # 2. 初始化各模块
     login_mgr = LoginManager(cfg.account, cfg.browser)

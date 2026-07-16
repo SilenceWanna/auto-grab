@@ -27,6 +27,8 @@ class Trip:
     train_codes: list[str] = field(default_factory=list)
     seat_types: list[str] = field(default_factory=list)
     allow_candidate: bool = False
+    # 票种:adult(成人票,默认) / student(学生票)
+    ticket_type: str = "adult"
 
 
 @dataclass
@@ -64,6 +66,9 @@ class Schedule:
     """
     # 每日放票时间点列表，格式 "HH:MM"，如 ["08:00", "13:00", "18:30"]
     rush_at: list[str] = field(default_factory=list)
+    # 若为 true 且 rush_at 为空,则根据 trip.from_station 自动查出该出发站的放票时刻。
+    # 手写 rush_at 时优先使用手写值。
+    auto: bool = False
     # 每个整点前多少秒开始"预热"（预登录、预打开查询页），默认 60s
     prep_seconds: int = 60
     # 整点后高频冲刺持续多少秒（默认 3 分钟）
@@ -117,6 +122,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         raise ValueError("至少需要配置一名乘客。")
     if not cfg.trip.dates:
         raise ValueError("至少需要配置一个乘车日期。")
+    if cfg.trip.ticket_type not in ("adult", "student"):
+        raise ValueError(f"trip.ticket_type 必须是 'adult' 或 'student',当前为 {cfg.trip.ticket_type!r}")
     # 校验放票时间格式 HH:MM
     import re
     for t in cfg.schedule.rush_at:
