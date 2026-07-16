@@ -57,6 +57,23 @@ class Order:
 
 
 @dataclass
+class Schedule:
+    """放票时段智能调度（可选）。
+
+    留空时脚本行为与阶段5相同（一直按 polling.interval_seconds 慢刷）。
+    """
+    # 每日放票时间点列表，格式 "HH:MM"，如 ["08:00", "13:00", "18:30"]
+    rush_at: list[str] = field(default_factory=list)
+    # 每个整点前多少秒开始"预热"（预登录、预打开查询页），默认 60s
+    prep_seconds: int = 60
+    # 整点后高频冲刺持续多少秒（默认 3 分钟）
+    rush_duration_seconds: int = 180
+    # 冲刺期间的查询间隔（秒），越小越快但更容易被 12306 限流
+    rush_interval_seconds: float = 0.3
+    rush_jitter_seconds: float = 0.4
+
+
+@dataclass
 class Config:
     account: Account
     trip: Trip
@@ -65,6 +82,7 @@ class Config:
     notify: Notify
     browser: Browser
     order: Order
+    schedule: Schedule
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
@@ -90,6 +108,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             notify=Notify(**raw.get("notify", {})),
             browser=Browser(**raw.get("browser", {})),
             order=Order(**raw.get("order", {})),
+            schedule=Schedule(**raw.get("schedule", {})),
         )
     except (KeyError, TypeError) as exc:
         raise ValueError(f"配置文件格式有误：{exc}") from exc
@@ -98,5 +117,10 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         raise ValueError("至少需要配置一名乘客。")
     if not cfg.trip.dates:
         raise ValueError("至少需要配置一个乘车日期。")
+    # 校验放票时间格式 HH:MM
+    import re
+    for t in cfg.schedule.rush_at:
+        if not re.fullmatch(r"\d{1,2}:\d{2}", t):
+            raise ValueError(f"schedule.rush_at 中的 {t!r} 不是合法的 HH:MM 时间格式。")
 
     return cfg

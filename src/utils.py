@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 
@@ -58,3 +59,30 @@ def retry(times: int = 3, delay: float = 1.0):
         return wrapper
 
     return decorator
+
+
+def next_rush_time(
+    rush_at: list[str],
+    now: datetime | None = None,
+) -> tuple[datetime, float] | None:
+    """算出「下一个放票时间点」及其距 now 的秒数。
+
+    rush_at: HH:MM 字符串列表，如 ["08:00", "13:00"]。
+    now: 参考"当前时间"（便于测试注入），默认取系统当前。
+    返回 (target_datetime, seconds_until) 或 None（列表为空时）。
+    如果今天所有整点都已过，返回明天第一个。
+    """
+    if not rush_at:
+        return None
+    now = now or datetime.now()
+    candidates: list[datetime] = []
+    for t in rush_at:
+        hh, mm = t.split(":")
+        today_target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        if today_target > now:
+            candidates.append(today_target)
+        else:
+            # 今天已过，加入明天同时间
+            candidates.append(today_target + timedelta(days=1))
+    target = min(candidates)
+    return target, (target - now).total_seconds()

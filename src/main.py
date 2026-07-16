@@ -6,6 +6,10 @@
 - 完整日志记录
 - 支持长时间无人值守运行
 
+阶段 6 目标（可选）：
+- 放票整点智能调度（config.schedule.rush_at）
+- PyInstaller 打包为 exe
+
 用法：
     python -m src.main
 """
@@ -14,13 +18,14 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import datetime
 
-from .config import load_config
+from .config import Schedule, load_config
 from .login import LoginManager
 from .notifier import Notifier
 from .order import OrderManager
 from .query import TicketQuery
-from .utils import setup_logger, sleep_with_jitter
+from .utils import next_rush_time, setup_logger, sleep_with_jitter
 
 logger = setup_logger()
 
@@ -42,6 +47,41 @@ def _fmt_duration(seconds: float) -> str:
     if seconds < 3600:
         return f"{seconds // 60} 分 {seconds % 60} 秒"
     return f"{seconds // 3600} 时 {(seconds % 3600) // 60} 分"
+
+
+def _current_phase(sched: Schedule) -> tuple[str, float, float, str]:
+    """根据当前时间和 schedule 配置，返回本轮的运行阶段。
+
+    返回 (phase, interval, jitter, describe)：
+    - phase: "idle" | "prep" | "rush"
+    - interval / jitter: 本轮结束后的睡眠参数
+    - describe: 打日志用的一句话说明
+
+    未配置 rush_at 时永远返回 "idle"（行为完全等同阶段5）。
+    """
+    if not sched.rush_at:
+        return "idle", 0.0, 0.0, ""  # interval 由调用方用 polling.* 兜底
+    nxt = next_rush_time(sched.rush_at)
+    if nxt is None:
+        return "idle", 0.0, 0.0, ""
+    target, secs_until = nxt
+    # 冲刺期：整点后 rush_duration 秒内
+    if -sched.rush_duration_seconds <= secs_until <= 0:
+        return (
+            "rush",
+            sched.rush_interval_seconds,
+            sched.rush_jitter_seconds,
+            f"冲刺中(距整点 {int(-secs_until)}s / 共 {sched.rush_duration_seconds}s)",
+        )
+    # 预热期：整点前 prep_seconds 内 -> 等到整点(不空刷)
+    if 0 < secs_until <= sched.prep_seconds:
+        return (
+            "prep",
+            secs_until,   # 用这个值直接睡到整点
+            0.0,
+            f"预热等待(距 {target:%H:%M} 还有 {int(secs_until)}s)",
+        )
+    return "idle", 0.0, 0.0, f"离下个整点 {target:%H:%M} 还有 {int(secs_until)}s"
 
 
 def run() -> int:
@@ -81,11 +121,18 @@ def run() -> int:
         attempts = 0
         consecutive_errors = 0        # 连续出错次数（用于指数退避）
         consecutive_login_fails = 0    # 连续重登失败次数（达到 MAX 则放弃）
+        last_phase = ""                # 上一轮的阶段（用于状态切换时打日志）
         while True:
             attempts += 1
             if cfg.polling.max_attempts and attempts > cfg.polling.max_attempts:
                 logger.info("已达最大尝试次数 %d，退出。", cfg.polling.max_attempts)
                 return 1
+
+            # 判定当前所处阶段（idle/prep/rush），据此决定睡眠参数与是否要真的查询
+            phase, phase_interval, phase_jitter, phase_desc = _current_phase(cfg.schedule)
+            if phase != last_phase and phase_desc:
+                logger.info("[调度] 进入 %s: %s", phase.upper(), phase_desc)
+                last_phase = phase
 
             # 心跳日志：每 HEARTBEAT_EVERY 轮打印一次运行状态
             if attempts % HEARTBEAT_EVERY == 0:
@@ -93,6 +140,12 @@ def run() -> int:
                     "[心跳] 仍在轮询，共 %d 次，运行 %s。",
                     attempts, _fmt_duration(time.time() - started_at),
                 )
+
+            # 预热阶段：不查询，直接睡到整点
+            if phase == "prep":
+                logger.info("[调度] 预热等待 %.1f 秒到整点...", phase_interval)
+                time.sleep(phase_interval)
+                continue
 
             round_had_error = False
             for date in cfg.trip.dates:
@@ -138,7 +191,7 @@ def run() -> int:
                     round_had_error = True
                     logger.exception("本轮出现异常，稍后重试：%s", exc)
 
-            # 睡眠：正常路径用基础间隔+抖动；连续多轮异常时指数退避防刷屏
+            # 睡眠：正常路径用基础间隔+抖动；rush 阶段用高频冲刺；连续多轮异常时指数退避防刷屏
             if round_had_error:
                 consecutive_errors += 1
                 if consecutive_errors >= ERROR_BACKOFF_THRESHOLD:
@@ -155,7 +208,10 @@ def run() -> int:
                     sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
             else:
                 consecutive_errors = 0  # 成功一轮就重置
-                sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
+                if phase == "rush":
+                    sleep_with_jitter(phase_interval, phase_jitter)
+                else:
+                    sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
     finally:
         # 无论何种退出路径都回收浏览器进程，避免残留堆积。
         # 用循环 + 屏蔽 KeyboardInterrupt 保证第二次 Ctrl+C 不会打断清理,

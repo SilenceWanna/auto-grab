@@ -63,5 +63,17 @@ order:
   # 确认流程无误、真正要抢票时，改为 false 才会真实提交订单。
   dry_run: true
 
+# ---------- 放票整点调度（可选）----------
+# 留空 rush_at 时脚本行为与阶段5相同（一直按 polling.interval_seconds 慢刷）。
+# 填写后：整点前 prep_seconds 内静等到整点、整点后 rush_duration_seconds 内高频冲刺，
+# 其他时段仍按 polling.interval_seconds 慢刷（防止错过意外余票）。
+schedule:
+  # 每日放票时间点（HH:MM），常见批次：08:00 / 13:00 / 18:30 等，按你要抢的车站实际放票时间填。
+  rush_at: []                     # 例如 ["13:00"]
+  prep_seconds: 60                # 整点前多少秒开始预热（静等到整点）
+  rush_duration_seconds: 180      # 整点后高频冲刺持续多少秒（默认 3 分钟）
+  rush_interval_seconds: 0.3      # 冲刺时的查询间隔（越小越快，但被限流风险越高）
+  rush_jitter_seconds: 0.4        # 冲刺间隔的随机抖动上限
+
 # ---------- 席别可选值 ----------
 # 商务座 / 特等座 / 一等座 / 二等座 / 高级软卧 / 软卧 / 动卧 / 硬卧 / 软座 / 硬座 / 无座
