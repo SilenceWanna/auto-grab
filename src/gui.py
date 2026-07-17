@@ -21,6 +21,7 @@ import yaml
 
 from .config import DEFAULT_CONFIG_PATH, load_config
 from .main import run as run_grab
+from .utils import lookup_release_time
 
 logger = logging.getLogger("auto-grab")
 
@@ -46,7 +47,7 @@ class GrabGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("12306 抢票")
-        self.root.geometry("720x640")
+        self.root.geometry("720x760")
 
         # 后台线程与日志队列
         self._log_queue: "queue.Queue[str]" = queue.Queue(maxsize=1000)
@@ -87,12 +88,39 @@ class GrabGUI:
         self.e_seats = row(6, "席别偏好 (逗号分隔):")
         self.e_passengers = row(7, "乘车人 (逗号分隔):")
 
+        # 票种下拉(v2)
+        ttk.Label(f, text="票种:").grid(row=8, column=0, sticky="e", padx=4, pady=3)
+        self.var_ticket = tk.StringVar(value="adult")
+        cb_ticket = ttk.Combobox(
+            f, textvariable=self.var_ticket, values=("adult", "student"),
+            state="readonly", width=12,
+        )
+        cb_ticket.grid(row=8, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(f, text="(adult=成人票  student=学生票)").grid(
+            row=8, column=1, sticky="w", padx=(140, 4),
+        )
+
+        # 放票整点(v2):可手写,留空则受 auto 影响
+        self.e_rush = row(9, "放票时刻 (HH:MM,逗号分隔,留空则按下方自动):")
+
+        # 自动查放票时刻开关(v2) + 探测结果实时提示
+        self.var_auto_sched = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            f, text="自动根据出发地查放票时刻(内置88站)",
+            variable=self.var_auto_sched,
+        ).grid(row=10, column=1, sticky="w", padx=4, pady=3)
+        self.lbl_release = ttk.Label(f, text="", foreground="#2a6")
+        self.lbl_release.grid(row=11, column=1, sticky="w", padx=4)
+        # 出发地变化时实时刷新提示
+        self.e_from.bind("<KeyRelease>", lambda _e: self._refresh_release_hint())
+        self.e_from.bind("<FocusOut>", lambda _e: self._refresh_release_hint())
+
         # dry_run 开关
         self.var_dry = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             f, text="干跑模式（不真实占座，测试用）",
             variable=self.var_dry,
-        ).grid(row=8, column=1, sticky="w", padx=4, pady=6)
+        ).grid(row=12, column=1, sticky="w", padx=4, pady=6)
 
         # 按钮行
         btns = ttk.Frame(self.root, padding=(10, 0))
@@ -103,6 +131,24 @@ class GrabGUI:
         self.btn_start.pack(side="left", padx=12)
         self.btn_stop = ttk.Button(btns, text="■ 停止", command=self._stop_grab, state="disabled")
         self.btn_stop.pack(side="left", padx=4)
+
+    def _refresh_release_hint(self) -> None:
+        """出发地变化时更新自动放票时刻的探测提示。"""
+        station = self.e_from.get().strip()
+        if not station:
+            self.lbl_release.config(text="", foreground="#2a6")
+            return
+        release = lookup_release_time(station)
+        if release:
+            self.lbl_release.config(
+                text=f"✓ 已识别 {station} 的放票时刻:{release}",
+                foreground="#2a6",
+            )
+        else:
+            self.lbl_release.config(
+                text=f"⚠ 内置表未收录 {station},请在上方「放票时刻」手填,例如 13:00",
+                foreground="#c60",
+            )
 
     def _build_log_panel(self) -> None:
         wrap = ttk.LabelFrame(self.root, text="运行日志", padding=6)
@@ -135,6 +181,7 @@ class GrabGUI:
         acc = raw.get("account", {})
         trip = raw.get("trip", {})
         order = raw.get("order", {})
+        schedule = raw.get("schedule", {})
         self._set(self.e_user, acc.get("username", ""))
         self._set(self.e_pwd, acc.get("password", ""))
         self._set(self.e_from, trip.get("from_station", ""))
@@ -144,6 +191,11 @@ class GrabGUI:
         self._set(self.e_seats, ", ".join(trip.get("seat_types", []) or []))
         self._set(self.e_passengers, ", ".join(raw.get("passengers", []) or []))
         self.var_dry.set(bool(order.get("dry_run", True)))
+        # v2 新字段
+        self.var_ticket.set(trip.get("ticket_type", "adult"))
+        self._set(self.e_rush, ", ".join(schedule.get("rush_at", []) or []))
+        self.var_auto_sched.set(bool(schedule.get("auto", False)))
+        self._refresh_release_hint()  # 加载后立即刷新提示
         if not silent:
             self._append_log(f"[GUI] 已从 {DEFAULT_CONFIG_PATH.name} 加载配置。")
 
@@ -169,11 +221,17 @@ class GrabGUI:
         raw["trip"]["train_codes"] = self._split(self.e_trains.get())
         raw["trip"]["seat_types"] = self._split(self.e_seats.get())
         raw["trip"].setdefault("allow_candidate", False)
+        raw["trip"]["ticket_type"] = self.var_ticket.get()
 
         raw["passengers"] = self._split(self.e_passengers.get())
 
         raw.setdefault("order", {})
         raw["order"]["dry_run"] = self.var_dry.get()
+
+        # v2:schedule 部分,保留 GUI 未涵盖的字段(prep/rush_duration/interval 等)
+        raw.setdefault("schedule", {})
+        raw["schedule"]["rush_at"] = self._split(self.e_rush.get())
+        raw["schedule"]["auto"] = self.var_auto_sched.get()
 
         try:
             with DEFAULT_CONFIG_PATH.open("w", encoding="utf-8") as f:
