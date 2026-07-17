@@ -95,6 +95,28 @@ def _current_phase(sched: Schedule) -> tuple[str, float, float, str]:
     return "idle", 0.0, 0.0, f"离下个整点 {target:%H:%M} 还有 {int(secs_until)}s"
 
 
+def _pick_candidate_target(query, trip, date, submitted: set[tuple[str, str]]):
+    """从当日无票车次里选一个还未候补过的目标。
+
+    优先按 trip.train_codes 顺序选;若 train_codes 为空,取查询结果第一个。
+    返回 TrainInfo 或 None(表示没有可候补的车次或都候补过了)。
+    """
+    try:
+        trains = query.query(date)
+    except Exception:  # noqa: BLE001
+        return None
+    if not trains:
+        return None
+    # 按 train_codes 优先顺序;为空则按查询顺序
+    if trip.train_codes:
+        order = {code: i for i, code in enumerate(trip.train_codes)}
+        trains = sorted(trains, key=lambda t: order.get(t.train_code, 999))
+    for t in trains:
+        if (date, t.train_code) not in submitted and t.secret_str:
+            return t
+    return None
+
+
 def run(stop_event=None) -> int:
     """主流程。返回进程退出码（0 成功抢到，非 0 异常/未抢到）。
 
@@ -155,6 +177,7 @@ def run(stop_event=None) -> int:
         consecutive_login_fails = 0    # 连续重登失败次数（达到 MAX 则放弃）
         last_phase = ""                # 上一轮的阶段（用于状态切换时打日志）
         announced_pre_sale: set[str] = set()  # 已提示"等待开票"的日期,避免刷屏
+        candidate_submitted: set[tuple[str, str]] = set()  # 已候补过的 (日期, 车次),避免重复提交
         while True:
             # 检查 GUI 停止请求(每轮开头一次)
             if stop_event is not None and stop_event.is_set():
@@ -214,6 +237,29 @@ def run(stop_event=None) -> int:
                                 )
                                 announced_pre_sale.add(date)
                             continue
+                        # 无票:如启用候补,对未候补过的目标车次尝试提交候补
+                        if cfg.trip.allow_candidate:
+                            candidate_train = _pick_candidate_target(
+                                query, cfg.trip, date, candidate_submitted,
+                            )
+                            if candidate_train is not None:
+                                seat = cfg.trip.seat_types[0] if cfg.trip.seat_types else "二等座"
+                                logger.info(
+                                    "[第 %d 次] %s 无票,尝试候补:车次=%s 席别=%s",
+                                    attempts, date, candidate_train.train_code, seat,
+                                )
+                                key = (date, candidate_train.train_code)
+                                if order_mgr.submit_candidate(candidate_train, seat, date):
+                                    candidate_submitted.add(key)
+                                    notifier.notify_success(
+                                        "候补已提交",
+                                        f"{date} {candidate_train.train_code} 已加入候补队列,请等待 12306 通知。",
+                                    )
+                                    logger.info("候补提交成功,继续轮询其它日期/车次。")
+                                elif order_mgr.dry_run:
+                                    # 干跑模式下候补也不真提交,标记已尝试避免重复走流程
+                                    candidate_submitted.add(key)
+                                continue
                         logger.info("[第 %d 次] %s 暂无余票。", attempts, date)
                         continue
 

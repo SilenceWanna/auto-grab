@@ -47,7 +47,7 @@ class GrabGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("12306 抢票")
-        self.root.geometry("720x760")
+        self.root.geometry("720x800")
 
         # 后台线程与日志队列
         self._log_queue: "queue.Queue[str]" = queue.Queue(maxsize=1000)
@@ -122,6 +122,13 @@ class GrabGUI:
             variable=self.var_dry,
         ).grid(row=12, column=1, sticky="w", padx=4, pady=6)
 
+        # 候补下单开关(v2.1)
+        self.var_candidate = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            f, text="无票时自动候补(v2.1) —— 加入 12306 候补队列,出票后按顺序分配",
+            variable=self.var_candidate,
+        ).grid(row=13, column=1, sticky="w", padx=4, pady=3)
+
         # 按钮行
         btns = ttk.Frame(self.root, padding=(10, 0))
         btns.pack(fill="x")
@@ -195,6 +202,8 @@ class GrabGUI:
         self.var_ticket.set(trip.get("ticket_type", "adult"))
         self._set(self.e_rush, ", ".join(schedule.get("rush_at", []) or []))
         self.var_auto_sched.set(bool(schedule.get("auto", False)))
+        # v2.1 候补开关
+        self.var_candidate.set(bool(trip.get("allow_candidate", False)))
         self._refresh_release_hint()  # 加载后立即刷新提示
         if not silent:
             self._append_log(f"[GUI] 已从 {DEFAULT_CONFIG_PATH.name} 加载配置。")
@@ -220,7 +229,7 @@ class GrabGUI:
         raw["trip"]["dates"] = self._split(self.e_dates.get())
         raw["trip"]["train_codes"] = self._split(self.e_trains.get())
         raw["trip"]["seat_types"] = self._split(self.e_seats.get())
-        raw["trip"].setdefault("allow_candidate", False)
+        raw["trip"]["allow_candidate"] = self.var_candidate.get()
         raw["trip"]["ticket_type"] = self.var_ticket.get()
 
         raw["passengers"] = self._split(self.e_passengers.get())
