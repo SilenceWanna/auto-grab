@@ -10,3 +10,6 @@ plyer>=2.1
 
 # requests —— 消息推送（Server酱/钉钉 Webhook 等）
 requests>=2.31.0
+
+# tkcalendar —— GUI 日期选择控件(v2.2)
+tkcalendar>=1.6

@@ -15,9 +15,11 @@ import logging
 import queue
 import threading
 import tkinter as tk
+from datetime import date, timedelta
 from tkinter import messagebox, ttk
 
 import yaml
+from tkcalendar import Calendar
 
 from .config import DEFAULT_CONFIG_PATH, load_config
 from .main import run as run_grab
@@ -47,14 +49,18 @@ class GrabGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("12306 抢票")
-        self.root.geometry("720x760")
+        self.root.geometry("820x860")
 
         # 后台线程与日志队列
         self._log_queue: "queue.Queue[str]" = queue.Queue(maxsize=1000)
         self._worker: threading.Thread | None = None
         self._stop_flag = threading.Event()
+        # 查车次专用的后台线程(与抢票线程互斥,避免同时用一个浏览器)
+        self._query_worker: threading.Thread | None = None
+        self._query_lock = threading.Lock()
 
         self._build_form()
+        self._build_query_result_panel()
         self._build_log_panel()
         self._attach_log_handler()
 
@@ -83,7 +89,16 @@ class GrabGUI:
         self.e_pwd.config(show="*")
         self.e_from = row(2, "出发地:", 20)
         self.e_to = row(3, "到达地:", 20)
-        self.e_dates = row(4, "日期 (逗号分隔):")
+
+        # 日期行:输入框 + 弹历按钮 + 查询按钮(v2.2)
+        ttk.Label(f, text="日期 (逗号分隔):").grid(row=4, column=0, sticky="e", padx=4, pady=3)
+        date_wrap = ttk.Frame(f)
+        date_wrap.grid(row=4, column=1, sticky="w", padx=4, pady=3)
+        self.e_dates = tk.Entry(date_wrap, width=26)
+        self.e_dates.pack(side="left")
+        ttk.Button(date_wrap, text="📅 选择", width=8, command=self._pick_date).pack(side="left", padx=(4, 0))
+        ttk.Button(date_wrap, text="🔍 查车次", width=10, command=self._query_trains_click).pack(side="left", padx=(4, 0))
+
         self.e_trains = row(5, "车次 (逗号分隔, 留空=全部):")
         self.e_seats = row(6, "席别偏好 (逗号分隔):")
         self.e_passengers = row(7, "乘车人 (逗号分隔):")
@@ -150,12 +165,175 @@ class GrabGUI:
                 foreground="#c60",
             )
 
+    # ------------------------------------------------------------------
+    # 日期选择 & 车次查询(v2.2)
+    # ------------------------------------------------------------------
+    def _pick_date(self) -> None:
+        """弹出日历,选中日期后追加到日期字段(YYYY-MM-DD,逗号分隔)。"""
+        top = tk.Toplevel(self.root)
+        top.title("选择乘车日期")
+        top.transient(self.root)
+        # 默认落在今天+1,预售期最大 15 天后
+        today = date.today()
+        cal = Calendar(
+            top,
+            selectmode="day",
+            year=today.year, month=today.month, day=today.day,
+            mindate=today,
+            maxdate=today + timedelta(days=30),
+            date_pattern="yyyy-mm-dd",
+        )
+        cal.pack(padx=10, pady=10)
+
+        def _confirm():
+            picked = cal.get_date()   # YYYY-MM-DD
+            existing = self._split(self.e_dates.get())
+            if picked not in existing:
+                existing.append(picked)
+                self.e_dates.delete(0, "end")
+                self.e_dates.insert(0, ", ".join(existing))
+            top.destroy()
+
+        btn_row = ttk.Frame(top)
+        btn_row.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_row, text="确定", command=_confirm).pack(side="right")
+        ttk.Button(btn_row, text="取消", command=top.destroy).pack(side="right", padx=(0, 6))
+        top.grab_set()
+
+    def _build_query_result_panel(self) -> None:
+        """车次查询结果面板(默认隐藏,查询后显示)。"""
+        self.qr_frame = ttk.LabelFrame(self.root, text="车次查询结果", padding=6)
+        # 先不 pack,等有结果再 pack
+        columns = ("train_code", "depart", "arrive", "duration", "seats")
+        self.qr_tree = ttk.Treeview(
+            self.qr_frame, columns=columns, show="headings", height=8,
+        )
+        headings = [("train_code", "车次", 80),
+                    ("depart", "出发", 80),
+                    ("arrive", "到达", 80),
+                    ("duration", "历时", 80),
+                    ("seats", "余票摘要(有票席别)", 340)]
+        for col, text, width in headings:
+            self.qr_tree.heading(col, text=text)
+            self.qr_tree.column(col, width=width, anchor="w")
+        self.qr_tree.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(self.qr_frame, orient="vertical", command=self.qr_tree.yview)
+        sb.pack(side="right", fill="y")
+        self.qr_tree.config(yscrollcommand=sb.set)
+        # 双击一行 -> 把该车次加入"车次"字段
+        self.qr_tree.bind("<Double-1>", self._on_tree_double_click)
+
+    def _on_tree_double_click(self, _event) -> None:
+        sel = self.qr_tree.selection()
+        if not sel:
+            return
+        code = self.qr_tree.item(sel[0], "values")[0]
+        existing = self._split(self.e_trains.get())
+        if code and code not in existing:
+            existing.append(code)
+            self.e_trains.delete(0, "end")
+            self.e_trains.insert(0, ", ".join(existing))
+            self._append_log(f"[GUI] 已把车次 {code} 加入抢票目标。")
+
+    def _query_trains_click(self) -> None:
+        """点"查车次"按钮:在后台线程启动浏览器+登录+查询,结果填入表格。"""
+        if not self._query_lock.acquire(blocking=False):
+            messagebox.showinfo("提示", "上一次查询还在进行中,请稍候。")
+            return
+
+        # 抢票线程正在跑,不要冲突
+        if self._worker and self._worker.is_alive():
+            self._query_lock.release()
+            messagebox.showwarning("提示", "抢票已在运行,查询暂不可用。")
+            return
+
+        dates = self._split(self.e_dates.get())
+        from_station = self.e_from.get().strip()
+        to_station = self.e_to.get().strip()
+        if not dates or not from_station or not to_station:
+            self._query_lock.release()
+            messagebox.showwarning("提示", "请先填写出发地、到达地、至少一个日期。")
+            return
+        # 只查第一个日期,避免重复启浏览器
+        target_date = dates[0]
+
+        # 显示结果面板并清空
+        if not self.qr_frame.winfo_ismapped():
+            self.qr_frame.pack(fill="both", expand=False, padx=10, pady=(0, 6), before=self.log_wrap)
+        self.qr_tree.delete(*self.qr_tree.get_children())
+        self._append_log(f"[GUI] 正在查询 {target_date} {from_station}->{to_station} 车次...")
+
+        def _worker():
+            try:
+                trains = self._run_query(from_station, to_station, target_date)
+                self.root.after(0, lambda: self._render_trains(trains, target_date))
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(0, lambda e=exc: self._append_log(f"[GUI] 查询失败:{e}"))
+            finally:
+                self._query_lock.release()
+
+        self._query_worker = threading.Thread(target=_worker, daemon=True)
+        self._query_worker.start()
+
+    def _run_query(self, from_station: str, to_station: str, target_date: str) -> list:
+        """在后台线程里执行:启动浏览器→登录→查询→关闭浏览器。返回 TrainInfo 列表。"""
+        try:
+            cfg = load_config()
+        except Exception:  # noqa: BLE001
+            self.root.after(0, lambda: messagebox.showerror(
+                "配置有误", "请先保存 config.yaml 再查询。",
+            ))
+            return []
+
+        # 用一个临时 Trip 覆盖行程,不影响用户配置
+        from dataclasses import replace
+        temp_trip = replace(
+            cfg.trip,
+            from_station=from_station,
+            to_station=to_station,
+            dates=[target_date],
+            train_codes=[],   # 不过滤,拿全部
+        )
+
+        from .login import LoginManager
+        from .query import TicketQuery
+
+        mgr = LoginManager(cfg.account, cfg.browser)
+        try:
+            mgr.start_browser()
+            if not mgr.login():
+                self.root.after(0, lambda: self._append_log("[GUI] 登录失败,无法查询。"))
+                return []
+            q = TicketQuery(temp_trip, page=mgr.page)
+            q.load_station_map()
+            return q.query(target_date)
+        finally:
+            mgr.close()
+
+    def _render_trains(self, trains: list, target_date: str) -> None:
+        """把车次列表渲染到 Treeview。"""
+        from .query import _NO_TICKET
+        if not trains:
+            self._append_log(f"[GUI] {target_date} 无匹配车次或查询失败。")
+            return
+        for t in trains:
+            seats = [f"{k}:{v}" for k, v in t.seats.items() if v and v not in _NO_TICKET]
+            self.qr_tree.insert("", "end", values=(
+                t.train_code, t.depart_time, t.arrive_time, t.duration,
+                "  ".join(seats) if seats else "(无余票)",
+            ))
+        self._append_log(
+            f"[GUI] {target_date} 查询完成,共 {len(trains)} 趟车次。"
+            f"双击某行可加入抢票目标车次。",
+        )
+
+    # ------------------------------------------------------------------
     def _build_log_panel(self) -> None:
-        wrap = ttk.LabelFrame(self.root, text="运行日志", padding=6)
-        wrap.pack(fill="both", expand=True, padx=10, pady=10)
-        self.log_text = tk.Text(wrap, wrap="none", state="disabled", height=20)
+        self.log_wrap = ttk.LabelFrame(self.root, text="运行日志", padding=6)
+        self.log_wrap.pack(fill="both", expand=True, padx=10, pady=10)
+        self.log_text = tk.Text(self.log_wrap, wrap="none", state="disabled", height=20)
         self.log_text.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.log_text.yview)
+        sb = ttk.Scrollbar(self.log_wrap, orient="vertical", command=self.log_text.yview)
         sb.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=sb.set)
 
