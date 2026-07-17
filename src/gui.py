@@ -269,9 +269,11 @@ class GrabGUI:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
 
+        stop_event = self._stop_flag  # 传给后端主循环
+
         def _worker():
             try:
-                code = run_grab()
+                code = run_grab(stop_event=stop_event)
                 self._append_log(f"[GUI] 抢票流程结束，退出码 {code}。")
             except Exception as exc:  # noqa: BLE001
                 self._append_log(f"[GUI] 抢票线程异常：{exc}")
@@ -284,13 +286,12 @@ class GrabGUI:
         self._append_log("[GUI] 已启动抢票线程。")
 
     def _stop_grab(self) -> None:
-        # 优雅停止:目前 run_grab 是阻塞循环,只有 KeyboardInterrupt 能打断。
-        # 在 GUI 里较难直接对子线程发送 SIGINT。这里给出提示;真正长期停机建议关窗。
-        messagebox.showinfo(
-            "停止说明",
-            "抢票循环运行在后台线程内。请通过关闭窗口或结束进程停止；"
-            "浏览器会在窗口关闭时被回收。",
-        )
+        """请求停止抢票循环。后端会在下一次轮询边界或睡眠段(<=0.2s)退出并回收浏览器。"""
+        if not self._worker or not self._worker.is_alive():
+            return
+        self._stop_flag.set()
+        self.btn_stop.config(state="disabled")
+        self._append_log("[GUI] 已发送停止信号,等待浏览器关闭...")
 
     def _reset_buttons(self) -> None:
         self.btn_start.config(state="normal")

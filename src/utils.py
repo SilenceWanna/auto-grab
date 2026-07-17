@@ -33,9 +33,23 @@ def setup_logger(name: str = "auto-grab", level: int = logging.INFO) -> logging.
     return logger
 
 
-def sleep_with_jitter(base: float, jitter: float) -> None:
-    """休眠 base + rand(0, jitter) 秒，用于轮询防频控。"""
-    time.sleep(base + random.uniform(0, jitter))
+def sleep_with_jitter(base: float, jitter: float, stop_event=None) -> None:
+    """休眠 base + rand(0, jitter) 秒，用于轮询防频控。
+
+    stop_event: 可选的 threading.Event。若提供,在睡眠期间会分段检查该 event,
+    一旦被 set 立即返回,便于 GUI「停止」按钮及时中断长睡眠。
+    """
+    duration = base + random.uniform(0, jitter)
+    if stop_event is None or duration <= 0.2:
+        time.sleep(duration)
+        return
+    # 按 0.2s 分段睡,每段检查 stop_event
+    end = time.monotonic() + duration
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0 or stop_event.is_set():
+            return
+        time.sleep(min(0.2, remaining))
 
 
 def retry(times: int = 3, delay: float = 1.0):

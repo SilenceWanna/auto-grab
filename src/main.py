@@ -95,8 +95,12 @@ def _current_phase(sched: Schedule) -> tuple[str, float, float, str]:
     return "idle", 0.0, 0.0, f"离下个整点 {target:%H:%M} 还有 {int(secs_until)}s"
 
 
-def run() -> int:
-    """主流程。返回进程退出码（0 成功抢到，非 0 异常/未抢到）。"""
+def run(stop_event=None) -> int:
+    """主流程。返回进程退出码（0 成功抢到，非 0 异常/未抢到）。
+
+    stop_event: 可选的 threading.Event。GUI 调用时传入,一旦 set 主循环
+    尽快退出并回收浏览器(退出码 130,与 Ctrl+C 一致)。CLI 调用不传即可。
+    """
     started_at = time.time()
     logger.info("=== 12306 自动抢票脚本启动 ===")
 
@@ -152,6 +156,10 @@ def run() -> int:
         last_phase = ""                # 上一轮的阶段（用于状态切换时打日志）
         announced_pre_sale: set[str] = set()  # 已提示"等待开票"的日期,避免刷屏
         while True:
+            # 检查 GUI 停止请求(每轮开头一次)
+            if stop_event is not None and stop_event.is_set():
+                logger.info("收到停止信号,退出主循环。")
+                return 130
             attempts += 1
             if cfg.polling.max_attempts and attempts > cfg.polling.max_attempts:
                 logger.info("已达最大尝试次数 %d，退出。", cfg.polling.max_attempts)
@@ -173,7 +181,8 @@ def run() -> int:
             # 预热阶段：不查询，直接睡到整点
             if phase == "prep":
                 logger.info("[调度] 预热等待 %.1f 秒到整点...", phase_interval)
-                time.sleep(phase_interval)
+                # 用可中断的分段睡眠代替 time.sleep,以便 GUI 停止能及时生效
+                sleep_with_jitter(phase_interval, 0.0, stop_event=stop_event)
                 continue
 
             round_had_error = False
@@ -280,15 +289,15 @@ def run() -> int:
                         "已连续 %d 轮出错，退避 %.1f 秒后重试。",
                         consecutive_errors, backoff,
                     )
-                    time.sleep(backoff)
+                    time.sleep(backoff) if stop_event is None else sleep_with_jitter(backoff, 0.0, stop_event=stop_event)
                 else:
-                    sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
+                    sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds, stop_event=stop_event)
             else:
                 consecutive_errors = 0  # 成功一轮就重置
                 if phase == "rush":
-                    sleep_with_jitter(phase_interval, phase_jitter)
+                    sleep_with_jitter(phase_interval, phase_jitter, stop_event=stop_event)
                 else:
-                    sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds)
+                    sleep_with_jitter(cfg.polling.interval_seconds, cfg.polling.jitter_seconds, stop_event=stop_event)
     finally:
         # 无论何种退出路径都回收浏览器进程，避免残留堆积。
         # 用循环 + 屏蔽 KeyboardInterrupt 保证第二次 Ctrl+C 不会打断清理,
