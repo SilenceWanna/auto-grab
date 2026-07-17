@@ -26,13 +26,6 @@ logger = logging.getLogger("auto-grab")
 # 查询页作为同源请求入口；预订成功后进入确认页。
 LEFT_TICKET_INIT_URL = "https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc"
 CONFIRM_PASSENGER_URL = "https://kyfw.12306.cn/otn/confirmPassenger/initDc"
-# 候补下单相关(v2.1)
-CANDIDATE_QUERY_URL = "https://kyfw.12306.cn/otn/lcQuery/init"       # 候补页(校验会话)
-CANDIDATE_CHOOSE_URL = "/otn/afterNate/chooseCandidate"              # 提交候补车次列表
-CANDIDATE_PASSENGER_URL = "/otn/afterNate/passengerInitApi"          # 候补页乘车人数据
-CANDIDATE_CONFIRM_URL = "/otn/afterNate/confirmHB"                   # 最终确认候补
-# 候补队列相关的日期上限固定为 20 天后(12306 硬编码,官方页面同)
-CANDIDATE_QUEUE_MAX_DAYS = 20
 ORDER_CONFIRM_TIMEOUT = 20.0
 ORDER_RESULT_TIMEOUT = 180.0
 
@@ -120,196 +113,45 @@ class OrderManager:
 
         return self._confirm_order()
 
-    # ------------------------------------------------------------------
-    # 候补下单(v2.1)
-    # ------------------------------------------------------------------
-    def submit_candidate(
-        self, train: TrainInfo, seat_type: str, date: str,
-    ) -> bool:
-        """把无票车次加入 12306 候补队列。
-
-        流程和普通下单类似但走 afterNate 系列接口:
-        1. 打开 lcQuery/init 校验会话
-        2. 提交 chooseCandidate: 车次 secretList (车次可以多趟)
-        3. 拉取 passengerInitApi 拿乘车人 token
-        4. 提交 confirmHB 确认
-
-        dry_run=True 时走到 step 4 前停住,不真实加入队列。
-        """
-        if self.trip is None:
-            raise RuntimeError("候补需要行程配置。")
-        if not train.secret_str:
-            logger.warning("候补失败:余票结果缺少 secret_str。")
-            return False
-
-        seat_code = SEAT_TYPE_CODE.get(seat_type, "O")
-        logger.info(
-            "准备候补:车次=%s 席别=%s 乘客=%s 日期=%s(dry_run=%s)",
-            train.train_code, seat_type, ",".join(self.passengers), date, self.dry_run,
-        )
-
-        # 1. 打开候补页,校验会话
-        self.page.get(CANDIDATE_QUERY_URL)
-        self.page.wait.doc_loaded()
-        self.page.wait(1)
-
-        # 2. 提交候补车次列表
-        secret_list = self._build_candidate_secret_list(train, date, seat_code)
-        choose_resp = self._post_json(
-            CANDIDATE_CHOOSE_URL,
-            {
-                "secretList": secret_list,
-                "_json_att": "",
-            },
-        )
-        if self._response_needs_relogin(choose_resp):
-            logger.info("候补入口提示需登录,尝试恢复 UAM 会话后重试。")
-            if self.login_manager is None or not self.login_manager.restore_session():
-                raise SessionExpired("候补前 UAM 会话已失效")
-            choose_resp = self._post_json(
-                CANDIDATE_CHOOSE_URL, {"secretList": secret_list, "_json_att": ""},
-            )
-        if not isinstance(choose_resp, dict) or not choose_resp.get("status"):
-            messages = choose_resp.get("messages") if isinstance(choose_resp, dict) else []
-            logger.warning(
-                "候补入口失败(HTTP=%s,消息=%s)",
-                choose_resp.get("httpStatus") if isinstance(choose_resp, dict) else "未知",
-                "；".join(str(m) for m in (messages or [])) or "无",
-            )
-            return False
-        logger.info("候补入口通过,准备拉取乘车人数据。")
-
-        # 3. 拉取候补页乘车人(拿 passengerTicketStr / oldPassengerStr)
-        passenger_resp = self._post_json(
-            CANDIDATE_PASSENGER_URL, {"_json_att": ""},
-        )
-        if not isinstance(passenger_resp, dict) or not passenger_resp.get("status"):
-            logger.warning("候补乘车人页拉取失败。")
-            return False
-        passenger_data = passenger_resp.get("data") or {}
-        normal_passengers = passenger_data.get("normal_passengers") or []
-        if not normal_passengers:
-            logger.warning("候补乘车人列表为空,请确认账号里已有乘车人。")
-            return False
-        ticket_strs = self._build_passenger_ticket_str(normal_passengers, seat_code)
-        if ticket_strs is None:
-            return False
-
-        # 4. 最终确认(dry-run 停在这里)
-        if self.dry_run:
-            logger.info(
-                "【干跑模式】候补已到最终提交前,不真实加入队列。"
-                "confirm 参数已就绪(乘车人数=%d)。",
-                len(ticket_strs[0].split("_")),
-            )
-            return False
-
-        confirm_resp = self._post_json(
-            CANDIDATE_CONFIRM_URL,
-            {
-                "passengerTicketStr": ticket_strs[0],
-                "oldPassengerStr": ticket_strs[1],
-                "_json_att": "",
-            },
-        )
-        if isinstance(confirm_resp, dict) and confirm_resp.get("status"):
-            logger.info("✅ 候补订单已提交,请在 12306 客户端/网页确认。")
-            return True
-        messages = confirm_resp.get("messages") if isinstance(confirm_resp, dict) else []
-        logger.warning(
-            "候补最终确认失败(HTTP=%s,消息=%s)",
-            confirm_resp.get("httpStatus") if isinstance(confirm_resp, dict) else "未知",
-            "；".join(str(m) for m in (messages or [])) or "无",
-        )
-        return False
-
-    def _build_candidate_secret_list(
-        self, train: TrainInfo, date: str, seat_code: str,
-    ) -> str:
-        """构造 secretList 字段:{secret}#{车次}#{日期}#{出发时刻}#{到达时刻}#{席别}|
-
-        12306 允许在一次请求里提交多趟候补车次(以 '|' 分隔),
-        当前只提交一趟。
-        """
-        parts = [
-            train.secret_str,
-            train.train_code,
-            date,
-            train.depart_time,
-            train.arrive_time,
-            seat_code,
-        ]
-        return "#".join(parts) + "|"
-
-    def _build_passenger_ticket_str(
-        self, normal_passengers: list[dict], seat_code: str,
-    ) -> tuple[str, str] | None:
-        """按配置的 passengers 姓名,从 normal_passengers 里匹配并拼 passengerTicketStr。
-
-        passengerTicketStr 格式(每人一段,'_' 连接):
-          {seat_code},0,1,{name},{id_type},{id_no},{mobile},N
-          (第 3 段票种:1=成人,3=残军,4=学生,6=儿童)
-        oldPassengerStr 格式(每人一段末尾 '_'):
-          {name},{id_type},{id_no},1_
-        """
-        # 票种代码:成人=1,学生=4(与 purpose_codes 对应)
-        ticket_code = "4" if self.trip and self.trip.ticket_type == "student" else "1"
-        selected: list[dict] = []
-        for name in self.passengers:
-            match = next(
-                (p for p in normal_passengers if p.get("passenger_name") == name),
-                None,
-            )
-            if match is None:
-                logger.warning("候补未找到乘车人「%s」。", name)
-                return None
-            selected.append(match)
-
-        ticket_parts = []
-        old_parts = []
-        for p in selected:
-            ticket_parts.append(
-                f"{seat_code},0,{ticket_code},{p.get('passenger_name','')},"
-                f"{p.get('passenger_id_type_code','')},{p.get('passenger_id_no','')},"
-                f"{p.get('mobile_no','')},N"
-            )
-            old_parts.append(
-                f"{p.get('passenger_name','')},"
-                f"{p.get('passenger_id_type_code','')},"
-                f"{p.get('passenger_id_no','')},1"
-            )
-        return "_".join(ticket_parts), "_".join(old_parts) + "_"
-
     def _post_json(self, path: str, form: dict) -> dict | None:
-        """在浏览器上下文里 POST 表单,解析 JSON 返回。同源请求自动带上 cookies。"""
+        """在浏览器上下文里 POST 表单,解析 JSON 返回。同源请求自动带上 cookies。
+
+        JS 内部 try/catch 包住整个 XHR,即使 CORS/网络错误也返回一个失败 dict,
+        不让异常冒到 Python 层导致主循环崩溃。
+        """
         return self.page.run_js(
             """
-            var path = arguments[0];
-            var form = arguments[1];
-            var params = new URLSearchParams();
-            Object.keys(form).forEach(function(k){ params.set(k, form[k]); });
-            var xhr = new XMLHttpRequest();
-            xhr.open('POST', path, false);
-            xhr.setRequestHeader(
-                'Content-Type',
-                'application/x-www-form-urlencoded; charset=UTF-8'
-            );
-            xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-            xhr.send(params.toString());
-            if (xhr.status < 200 || xhr.status >= 300) {
-                return {httpStatus: xhr.status, status: false, messages: []};
-            }
             try {
-                var payload = JSON.parse(xhr.responseText);
-                return {
-                    httpStatus: xhr.status,
-                    status: Boolean(payload.status),
-                    data: payload.data,
-                    messages: payload.messages || [],
-                    validateMessages: payload.validateMessages || {}
-                };
-            } catch (e) {
-                return {httpStatus: xhr.status, status: false, messages: []};
+                var path = arguments[0];
+                var form = arguments[1];
+                var params = new URLSearchParams();
+                Object.keys(form).forEach(function(k){ params.set(k, form[k]); });
+                var xhr = new XMLHttpRequest();
+                xhr.open('POST', path, false);
+                xhr.setRequestHeader(
+                    'Content-Type',
+                    'application/x-www-form-urlencoded; charset=UTF-8'
+                );
+                xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+                xhr.send(params.toString());
+                if (xhr.status < 200 || xhr.status >= 300) {
+                    return {httpStatus: xhr.status, status: false, messages: ['HTTP ' + xhr.status]};
+                }
+                try {
+                    var payload = JSON.parse(xhr.responseText);
+                    return {
+                        httpStatus: xhr.status,
+                        status: Boolean(payload.status),
+                        data: payload.data,
+                        messages: payload.messages || [],
+                        validateMessages: payload.validateMessages || {}
+                    };
+                } catch (parseErr) {
+                    return {httpStatus: xhr.status, status: false, messages: ['JSON parse fail']};
+                }
+            } catch (netErr) {
+                // NetworkError / DOMException 等,统一返回失败,不冒到 Python
+                return {httpStatus: 0, status: false, messages: [String(netErr && netErr.message || netErr)]};
             }
             """,
             path, form,
