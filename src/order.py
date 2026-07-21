@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import time
 
+from DrissionPage.errors import NoRectError
+
 
 class SessionExpired(RuntimeError):
     """下单前 UAM 会话恢复失败——需要主循环触发完整重登。"""
@@ -535,8 +537,30 @@ class OrderManager:
             )
             return False
 
-        confirm.click()
-        logger.info("已确认提交，等待排队结果。")
+        # 点击确认。若元素在竞态间隙消失(NoRectError),
+        # 可能 12306 已自动接受了排队,继续检测 payOrder/init。
+        clicked_ok = False
+        try:
+            confirm.click()
+            clicked_ok = True
+            logger.info("已确认提交，等待排队结果。")
+        except NoRectError:
+            logger.warning(
+                "排队确认框在 click 前消失(可能被12306自动关闭),尝试用JS点击兜底...",
+            )
+            # 尝试 JS click(不需要元素可见)
+            try:
+                # 从 SEL_CONFIRM_QUEUE_BTN 派生 id (去掉开头的 #)
+                btn_id = SEL_CONFIRM_QUEUE_BTN.lstrip("#")
+                self.page.run_js(
+                    "var el = document.getElementById(arguments[0]);"
+                    "if (el && typeof el.click === 'function') { el.click(); }",
+                    btn_id,
+                )
+                clicked_ok = True
+                logger.info("已用JS点击确认按钮,等待排队结果。")
+            except Exception as js_exc:  # noqa: BLE001
+                logger.warning("JS 点击也失败:%s。继续检测 URL 是否已跳转...", js_exc)
 
         failure_words = ("订票失败", "出票失败", "无法提交", "网络忙", "订单已撤销")
         deadline = time.monotonic() + ORDER_RESULT_TIMEOUT
