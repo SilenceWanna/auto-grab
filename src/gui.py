@@ -173,17 +173,32 @@ class GrabGUI:
         top = tk.Toplevel(self.root)
         top.title("选择乘车日期")
         top.transient(self.root)
-        # 默认落在今天+1,预售期最大 15 天后
         today = date.today()
+        # 默认锚点:若日期字段已有值,落在最后一个;否则落在 today+3
+        # (避免用户想选未来日期时,日历默认停在今天,还要手动翻月)
+        existing = self._split(self.e_dates.get())
+        anchor = today + timedelta(days=3)
+        if existing:
+            from datetime import datetime as _dt
+            for s in reversed(existing):
+                try:
+                    d = _dt.strptime(s, "%Y-%m-%d").date()
+                    if today <= d <= today + timedelta(days=30):
+                        anchor = d
+                        break
+                except ValueError:
+                    continue
         cal = Calendar(
             top,
             selectmode="day",
-            year=today.year, month=today.month, day=today.day,
+            year=anchor.year, month=anchor.month, day=anchor.day,
             mindate=today,
             maxdate=today + timedelta(days=30),
             date_pattern="yyyy-mm-dd",
         )
         cal.pack(padx=10, pady=10)
+        # 显式选中该锚点日期(避免只是"月份定位"而未选中)
+        cal.selection_set(anchor)
 
         def _confirm():
             picked = cal.get_date()   # YYYY-MM-DD
@@ -194,9 +209,17 @@ class GrabGUI:
                 self.e_dates.insert(0, ", ".join(existing))
             top.destroy()
 
+        def _replace():
+            """清空原有日期,只保留当前选中的日期(常用于重新选择)。"""
+            picked = cal.get_date()
+            self.e_dates.delete(0, "end")
+            self.e_dates.insert(0, picked)
+            top.destroy()
+
         btn_row = ttk.Frame(top)
         btn_row.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(btn_row, text="确定", command=_confirm).pack(side="right")
+        ttk.Button(btn_row, text="替换", command=_replace).pack(side="right")
+        ttk.Button(btn_row, text="追加", command=_confirm).pack(side="right", padx=(0, 6))
         ttk.Button(btn_row, text="取消", command=top.destroy).pack(side="right", padx=(0, 6))
         top.grab_set()
 

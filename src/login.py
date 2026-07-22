@@ -188,6 +188,12 @@ class LoginManager:
         # 2. 账号密码登录
         logger.info("开始账号密码登录。")
         self.page.get(LOGIN_URL)
+        # 12306 登录页有 nc.js 滑块+登录 SDK 等重资源,显式等待 DOM 就绪,
+        # 否则脚本会在页面还没渲染时找 #J-userName 全部 timeout。
+        try:
+            self.page.wait.doc_loaded(timeout=15)
+        except Exception:  # noqa: BLE001
+            pass  # 超时也继续,后面找元素时若失败会 return False
 
         # 切换到「账号登录」标签（默认可能是扫码登录）
         tab = self.page.ele(SEL_ACCOUNT_LOGIN_TAB, timeout=5)
