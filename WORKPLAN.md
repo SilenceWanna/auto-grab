@@ -16,6 +16,22 @@
 - ✅ GUI 增强:v2 新字段全部接入,出发地实时提示放票时刻(commit 6adedad)
 - ✅ GUI 停止按钮真正生效(stop_event 贯穿主循环与睡眠,commit efe86a3)
 
+**v2.3 下单链路性能优化**(2026-07-22 ✅ 代码完成待实测):
+- ✅ 优化 `_open_booking` 与 `_confirm_order` 中的等待/加载步骤,把每轮
+  submit 耗时从**实测 94 秒降到目标 <10 秒**
+- **背景**:2026-07-21 实测抢 Z286 硬卧,发现余票→提交前耗时 90+ 秒,
+  远慢于热门票池秒空节奏,导致 12306 端秒空拒绝、弹窗一闪即消,
+  触发 NoRectError。虽然 NoRectError bug 已在 commit d17586d 修复,
+  但根本问题是链路太慢。
+- **改动清单**:
+  - [x] 页面预热标志 `_init_page_warm`:submit 首次 navigate init,之后按 URL 判定是否需要重新 navigate
+  - [x] 去掉 `_open_booking` 里每次重复的 `page.wait(2)` 硬睡眠
+  - [x] `wait.doc_loaded()` 加 5 秒超时,不再无限等
+  - [x] `ele(SEL_SUBMIT_ORDER_BTN, timeout=10)` 减到 5 秒
+  - [x] 单元测试:mock page 模拟 3 种场景(冷启动/从确认页返回/已在 init 页)全过
+- **验收**:等下次真实抢票场景实测(冷门票即可,验证从"发现余票"到
+  "最终提交参数校验通过"总耗时降低)
+
 **v2.2 GUI 增强**(2026-07-17):
 - ✅ 日期字段接入 `tkcalendar` 弹历选择器,支持多日追加
 - ✅ 新增「🔍 查车次」按钮:GUI 里手动查询当日车次并显示表格

@@ -68,6 +68,9 @@ class OrderManager:
         self.dry_run = dry_run
         self.trip = trip
         self.login_manager = login_manager
+        # v2.3 性能优化:标记查询页是否已"热"(已 navigate 过且仍在同域)
+        # False 时首次 submit 会 navigate 到 leftTicket/init,之后复用
+        self._init_page_warm = False
 
     def submit(self, train: TrainInfo, seat_type: str, date: str = "") -> bool:
         """对指定车次、席别下单。
@@ -192,9 +195,23 @@ class OrderManager:
         if not train.secret_str:
             raise ValueError("余票结果缺少 secret_str，无法预订。")
 
-        self.page.get(LEFT_TICKET_INIT_URL)
-        self.page.wait.doc_loaded()
-        self.page.wait(2)
+        # v2.3 性能优化:submitOrderRequest 是同源 XHR,只要浏览器在 12306.cn
+        # 域下就能发。init 页只需首次加载或上轮 submit 后跳到别处时重新导航。
+        # 不再每次 submit 都强制 navigate + wait(2),那是 60 秒纯浪费。
+        current_url = str(self.page.url) if self.page else ""
+        needs_navigate = (
+            not self._init_page_warm
+            or "kyfw.12306.cn" not in current_url
+            or "confirmPassenger" in current_url  # 上轮 submit 后跳去了确认页
+            or "payOrder" in current_url          # 上轮成功进入待支付
+        )
+        if needs_navigate:
+            self.page.get(LEFT_TICKET_INIT_URL)
+            try:
+                self.page.wait.doc_loaded(timeout=5)  # 加超时,不再无限等
+            except Exception:  # noqa: BLE001
+                pass  # 加载慢也不阻塞,反正是同域 XHR,doc 未完成也能发
+            self._init_page_warm = True
 
         # 先直接尝试提交；若接口回复"需要登录",再 restore 一次并重试。
         response = self._request_submit_order(train, date)
@@ -220,10 +237,13 @@ class OrderManager:
             date,
         )
         self.page.get(CONFIRM_PASSENGER_URL)
-        self.page.wait.doc_loaded()
+        try:
+            self.page.wait.doc_loaded(timeout=5)  # v2.3:加超时
+        except Exception:  # noqa: BLE001
+            pass
         found = (
             "confirmPassenger" in str(self.page.url)
-            and self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=10) is not None
+            and self.page.ele(SEL_SUBMIT_ORDER_BTN, timeout=5) is not None  # v2.3:10s→5s
         )
         logger.info("已进入订单确认页，提交按钮=%s。", found)
         return found
