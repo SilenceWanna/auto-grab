@@ -197,10 +197,32 @@ class LoginManager:
     def login(self) -> bool:
         """执行登录，成功返回 True。
 
-        流程：先尝试复用本地 cookies；失败再走账号密码 + 人工验证码登录。
+        - attach 模式(attach_port>0): 假设用户已在被 attach 的浏览器里登录 12306,
+          直接检查 restore_session/is_logged_in. 不注入本地 cookies (避免污染),
+          不走账密登录. 若未登录则提示用户手动登录后重试.
+        - auto-launch 模式(默认): 先复用本地 cookies -> UAM 握手, 失败走账密登录.
         """
         if self.page is None:
             raise RuntimeError("请先调用 start_browser()。")
+
+        # attach 模式:浏览器由用户维护,不注入 cookies 也不自己登录
+        if self.browser_cfg.attach_port and self.browser_cfg.attach_port > 0:
+            # 保存被 attach 浏览器的 cookies 到本地(供 auto-launch 模式复用)
+            try:
+                if self.restore_session() or self.is_logged_in():
+                    logger.info("attach 到已登录的浏览器,直接使用其登录态。")
+                    self._save_cookies()
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("attach 模式下检查登录态出错:%s", exc)
+            logger.error(
+                "attach 到的浏览器 (端口 %d) 未处于 12306 登录态。请手动:\n"
+                "  1) 在该浏览器窗口打开 https://kyfw.12306.cn/otn/resources/login.html\n"
+                "  2) 手动登录(过滑块/账密)\n"
+                "  3) 重新点抢票",
+                self.browser_cfg.attach_port,
+            )
+            return False
 
         # 1. 尝试复用已保存的会话。
         # 只信 restore_session 的结果——它做了完整的 UAM 握手,能验证 tk 还能用。
