@@ -16,7 +16,19 @@
 - ✅ GUI 增强:v2 新字段全部接入,出发地实时提示放票时刻(commit 6adedad)
 - ✅ GUI 停止按钮真正生效(stop_event 贯穿主循环与睡眠,commit efe86a3)
 
-**v2.3.1 热门抢票实战验证**(2026-07-22 12:00 待跑):
+**v2.3.2 浏览器 attach 模式**(2026-07-22 紧急,阻塞抢票):
+- **背景**:2026-07-22 11:25 尝试抢票前侦察时,DrissionPage 4.2.0b9
+  auto-launch Chrome 9331/9332/9333 全部失败,但手动启 Chrome + 调试端口
+  9333 完全 OK, 且 DrissionPage 用 `set_address("127.0.0.1:9333")` 能连上。
+  说明库的 auto-launch 逻辑在此机器上不稳(与 07-15 症状类似),但 attach
+  路径完全可用。
+- **修法**:config 新增 `browser.attach_port` 字段。设置后 LoginManager 走
+  `set_address` 连已启动的浏览器,不再自启。用户先手动 chrome/msedge
+  --remote-debugging-port=9333 挂着,脚本 attach 上去。
+- **附加价值**:attach 模式下**cookies 直接复用用户浏览器**,免过滑块最流畅
+- **验收**:GUI 里配置 attach_port=9333,查车次/抢票流程全部通
+
+**v2.3.1 热门抢票实战验证**(2026-07-22 阻塞于环境问题,已延期):
 - 🎯 目标:用 v2.3 的性能优化真去抢一次热门整点票,验证 2-4 秒 submit 是否真能对抗票池秒空
 - 场景:12:00 太原南 → 北京西, 08-06 出行, dry_run=false
 - **1044-1055 侦察时发现两个 bug 需先修**:

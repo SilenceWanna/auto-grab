@@ -50,6 +50,10 @@ class Notify:
 class Browser:
     headless: bool = False
     binary_path: str = ""
+    # attach 模式(v2.3.2):非 0 时不自启浏览器,而是连接用户已手动启动的
+    # chrome/edge --remote-debugging-port=<该端口>. 用于绕过库的 auto-launch
+    # 在某些机器上不稳的问题, 同时也能复用用户浏览器的登录态。
+    attach_port: int = 0
 
 
 @dataclass

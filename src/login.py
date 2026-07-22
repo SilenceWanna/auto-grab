@@ -50,11 +50,29 @@ class LoginManager:
     def start_browser(self) -> None:
         """启动浏览器实例，应用配置中的 headless / binary_path。
 
-        为提高在 Windows 上的稳定性：
-        - 使用独立的用户数据目录（BROWSER_PROFILE_DIR），与日常 Chrome 隔离
-        - 显式指定固定端口而非 auto_port（后者在部分 4.1.x 版本上握手不稳）
-        - 启动失败时清理 Profile 内的 Singleton 锁文件并重试
+        - attach 模式(browser.attach_port > 0):连接用户已手动启动的
+          chrome/edge --remote-debugging-port=<该端口>. 不自启, 不管 profile,
+          直接 set_address 挂上。**首选**方案,避免 auto-launch 在部分机器上失败。
+        - auto-launch 模式(默认):库自启浏览器,用独立 Profile,重试 3 次。
         """
+        # attach 分支:优先尝试
+        if self.browser_cfg.attach_port and self.browser_cfg.attach_port > 0:
+            opts = ChromiumOptions()
+            opts.set_address(f"127.0.0.1:{self.browser_cfg.attach_port}")
+            try:
+                self.page = ChromiumPage(opts)
+                logger.info(
+                    "浏览器已 attach(端口: %d,复用用户已启动的浏览器)。",
+                    self.browser_cfg.attach_port,
+                )
+                return
+            except Exception as exc:
+                raise RuntimeError(
+                    f"attach 到 127.0.0.1:{self.browser_cfg.attach_port} 失败:{exc}\n"
+                    f"请确认已手动启动 chrome/edge 且带 --remote-debugging-port={self.browser_cfg.attach_port}"
+                ) from exc
+
+        # auto-launch 分支(默认,原逻辑)
         import shutil
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -129,9 +147,19 @@ class LoginManager:
         self.login()
 
     def close(self) -> None:
-        """关闭浏览器,同时清理可能残留的子进程,避免进程堆积。"""
+        """关闭浏览器,同时清理可能残留的子进程,避免进程堆积。
+
+        attach 模式(attach_port > 0)只解除引用,不 quit 用户的浏览器。
+        """
         if self.page is None:
             return
+        # attach 模式:只解除引用,不动用户浏览器
+        if self.browser_cfg.attach_port and self.browser_cfg.attach_port > 0:
+            logger.info("attach 模式,不关闭用户浏览器(仅解除引用)。")
+            self.page = None
+            return
+
+        # auto-launch 模式:原逻辑,quit + 强杀子进程
         # 先收集浏览器进程的子进程(渲染/GPU/utility 等)
         child_pids: list[int] = []
         try:

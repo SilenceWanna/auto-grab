@@ -49,7 +49,7 @@ class GrabGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("12306 抢票")
-        self.root.geometry("820x860")
+        self.root.geometry("880x900")
 
         # 后台线程与日志队列
         self._log_queue: "queue.Queue[str]" = queue.Queue(maxsize=1000)
@@ -136,6 +136,18 @@ class GrabGUI:
             f, text="干跑模式（不真实占座，测试用）",
             variable=self.var_dry,
         ).grid(row=12, column=1, sticky="w", padx=4, pady=6)
+
+        # 浏览器 attach_port(v2.3.2)
+        ttk.Label(f, text="attach 端口:").grid(row=13, column=0, sticky="e", padx=4, pady=3)
+        attach_wrap = ttk.Frame(f)
+        attach_wrap.grid(row=13, column=1, sticky="w", padx=4, pady=3)
+        self.e_attach_port = tk.Entry(attach_wrap, width=8)
+        self.e_attach_port.pack(side="left")
+        ttk.Label(
+            attach_wrap,
+            text="(可选,填0=自启浏览器。填9333=先手动启浏览器 --remote-debugging-port=9333 后连接)",
+            foreground="#666",
+        ).pack(side="left", padx=(4, 0))
 
         # 按钮行
         btns = ttk.Frame(self.root, padding=(10, 0))
@@ -396,6 +408,10 @@ class GrabGUI:
         self.var_ticket.set(trip.get("ticket_type", "adult"))
         self._set(self.e_rush, ", ".join(schedule.get("rush_at", []) or []))
         self.var_auto_sched.set(bool(schedule.get("auto", False)))
+        # attach_port(v2.3.2)
+        browser_cfg = raw.get("browser", {})
+        attach = browser_cfg.get("attach_port", 0) or 0
+        self._set(self.e_attach_port, str(attach) if attach else "")
         self._refresh_release_hint()  # 加载后立即刷新提示
         if not silent:
             self._append_log(f"[GUI] 已从 {DEFAULT_CONFIG_PATH.name} 加载配置。")
@@ -433,6 +449,14 @@ class GrabGUI:
         raw.setdefault("schedule", {})
         raw["schedule"]["rush_at"] = self._split(self.e_rush.get())
         raw["schedule"]["auto"] = self.var_auto_sched.get()
+
+        # attach_port(v2.3.2)
+        raw.setdefault("browser", {})
+        attach_txt = self.e_attach_port.get().strip()
+        try:
+            raw["browser"]["attach_port"] = int(attach_txt) if attach_txt else 0
+        except ValueError:
+            raw["browser"]["attach_port"] = 0
 
         try:
             with DEFAULT_CONFIG_PATH.open("w", encoding="utf-8") as f:
